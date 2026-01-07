@@ -4,6 +4,7 @@ from decouple import config
 from dydx_v4_client.node.client import NodeClient
 from dydx_v4_client.indexer.rest.indexer_client import IndexerClient
 from dydx_v4_client.network import make_testnet
+from dydx_v4_client.wallet import Wallet
 from constants import (
 WALLET_ADDRESS,
 API_KEY,
@@ -21,6 +22,7 @@ CUSTOM_TESTNET = make_testnet(
 async def connect_dydx():
         node = None
         indexer = None
+        wallet = None
 
         try:
             #print("🔌 Conectando al Nodo (Ejecución)...")
@@ -28,6 +30,8 @@ async def connect_dydx():
 
             #print("👁️ Conectando al Indexer (Datos)...")
             indexer = IndexerClient(CUSTOM_TESTNET.rest_indexer)
+
+            wallet = await Wallet.from_mnemonic(node, API_KEY, WALLET_ADDRESS)
 
             # Verificación rápida de que la cuenta existe
             response = await indexer.account.get_subaccounts(WALLET_ADDRESS)
@@ -43,4 +47,4 @@ async def connect_dydx():
                 # Si falla, devolvemos None para que el main sepa que hubo error
                 return None, None
 
-        return node, indexer
+        return node, indexer, wallet

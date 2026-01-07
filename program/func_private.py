@@ -1,56 +1,128 @@
 import random
 import time
-from datetime import datetime, timedelta
-from func_utils import format_number
-from pprint import pprint
-from constants import API_KEY, WALLET_ADDRESS
-
+import asyncio
 from dydx_v4_client import MAX_CLIENT_ID, OrderFlags
-from v4_proto.dydxprotocol.clob.order_pb2 import Order
-
 from dydx_v4_client.indexer.rest.constants import OrderType
-from dydx_v4_client.indexer.rest.indexer_client import IndexerClient
-from dydx_v4_client.network import TESTNET
-from dydx_v4_client.node.client import NodeClient
 from dydx_v4_client.node.market import Market
 from dydx_v4_client.wallet import Wallet
+from v4_proto.dydxprotocol.clob.order_pb2 import Order
 
+from constants import API_KEY, WALLET_ADDRESS
+
+# Get existing open positions
+async def is_open_positions(indexer, market):
+       # Protect API
+    await asyncio.sleep(0.2)
+
+    try:
+        account_resp = await indexer.account.get_subaccount(WALLET_ADDRESS, 0)
+        subaccount = account_resp.get("subaccount", {})
+
+        positions = subaccount.get("openPerpetualPositions", {})
+
+
+        if market in positions:
+            size = float(positions[market].get("size", 0))
+            return abs(size) > 0
+
+        return False
+
+    except Exception as e:
+        print(f"Error consulting positions in {market}: {e}")
+        return False
+
+
+# Check order status
+async def check_order_status(indexer, order_id):
+
+    await asyncio.sleep(3)
+    try:
+        response = await indexer.account.get_subaccount_orders(
+            address=WALLET_ADDRESS.strip(),
+            subaccount_number=0
+        )
+
+        if response is None:
+            print("Warning: Indexer is None.")
+            return "UNKNOWN"
+
+        orders = response if isinstance(response, list) else response.get("orders", [])
+
+        for order in orders:
+            if str(order.get("clientId")) == str(order_id):
+                return order.get("status")
+
+        return "NOT_FOUND"
+    except Exception as e:
+        print(f"Error in Indexer: {e}")
+        return "FAILED"
 
 
 # Place market order
-async def place_market_order(node, indexer, market, side, size, price, reduce_only):
-    MARKET_ID="BTC-USD"
+async def place_market_order(node, indexer, wallet, market, side, size, price, reduce_only):
+    try:
+        if wallet is None:
+            wallet = await Wallet.from_mnemonic(node, API_KEY.strip(), WALLET_ADDRESS.strip())
 
-    # Get position ID
-    market = Market(
-        (await indexer.markets.get_perpetual_markets(MARKET_ID))["markets"][MARKET_ID]
-    )
-    wallet = await Wallet.from_mnemonic(node, API_KEY, WALLET_ADDRESS)
+        # 2. Obtener datos del mercado (necesario para el ID y el Oracle)
+        m_data = await indexer.markets.get_perpetual_markets(market)
+        market_data = m_data["markets"][market]
+        oracle_price = float(market_data["oraclePrice"])
+        market_obj = Market(market_data)
 
-    order_id = market.order_id(
-        WALLET_ADDRESS, 0, random.randint(0, MAX_CLIENT_ID), OrderFlags.SHORT_TERM
-    )
+        if side == "BUY":
+            execution_price = oracle_price * 1.1
+            dydx_side = Order.Side.SIDE_BUY
+        else:
+            execution_price = 0
+            dydx_side = Order.Side.SIDE_SELL
 
-    # Get expiration time
-    server_time = node.public.get_time()
-    expiration = datetime.fromisoformat(server_time.data["iso"].replace("Z", "")) + timedelta(seconds=70)
+        # 4. Configurar IDs
+        client_id = random.randint(0, MAX_CLIENT_ID)
+        # Nota: Usamos la secuencia actual de la memoria de la wallet
+        order_id = market_obj.order_id(
+            WALLET_ADDRESS.strip(), 0, client_id, OrderFlags.SHORT_TERM
+        )
 
-    # Place an order
-    placed_order = market.order(
-        order_id=order_id,
-        order_type=OrderType.MARKET,
-        post_only=False,
-        side=side,
-        size=size,
-        price=price,  # Recommend set to oracle price - 5% or lower for SELL, oracle price + 5% for BUY
-        limit_fee = '0.015',
-        expiration_epoch_seconds=expiration.timestamp(),
-        time_in_force = "FOK",
-        reduce_only=reduce_only
-    )
+        current_block = await node.latest_block_height()
 
-    # Return result
-    return placed_order.data
+        # 5. Crear la orden
+        placed_order = market_obj.order(
+            order_id=order_id,
+            order_type=OrderType.MARKET,
+            post_only=False,
+            side=dydx_side,
+            size=float(size),
+            price=execution_price,
+            time_in_force=Order.TimeInForce.TIME_IN_FORCE_UNSPECIFIED,
+            reduce_only=reduce_only,
+            good_til_block=current_block + 20,
+        )
+
+        print(f">>> [TX] Enviando {side} {market} Size: {size} Price: {execution_price}...")
+
+        # 6. Enviar transacción
+        transaction = await node.place_order(
+            wallet=wallet,
+            order=placed_order,
+        )
+
+        wallet.sequence += 1
+
+        placed_order_result = {
+            "order": {
+                "id": str(client_id),
+                "status": "PENDING",
+                "market": market
+            },
+            "tx_hash": getattr(transaction, 'tx_hash', 'unknown')
+        }
+
+        return placed_order_result
+
+    except Exception as e:
+        print(f"Error enviando orden: {e}")
+        return None
 
 
 # Abort all open positions
@@ -145,7 +217,7 @@ async def abort_all_positions(node, indexer):
             except Exception as e:
                 print(f"Error closing position {market_name}: {e}")
 
-            time.sleep(1)  # Pausa para evitar rate limits
+            await asyncio.sleep(1)  # Pausa para evitar rate limits
 
     except Exception as e:
         print(f"Error closing positions: {e}")

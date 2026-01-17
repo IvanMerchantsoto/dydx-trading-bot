@@ -1,13 +1,14 @@
 import random
 import time
 import asyncio
+
 from dydx_v4_client import MAX_CLIENT_ID, OrderFlags
 from dydx_v4_client.indexer.rest.constants import OrderType
 from dydx_v4_client.node.market import Market
 from dydx_v4_client.wallet import Wallet
 from v4_proto.dydxprotocol.clob.order_pb2 import Order
 
-from constants import API_KEY, WALLET_ADDRESS
+from constants import API_KEY, WALLET_ADDRESS, USD_PER_TRADE
 
 # Get existing open positions
 async def is_open_positions(indexer, market):
@@ -59,7 +60,7 @@ async def check_order_status(indexer, order_id):
 
 
 # Place market order
-async def place_market_order(node, indexer, wallet, market, side, size, price, reduce_only):
+async def place_market_order(node, indexer, wallet, market, side, size, price, reduce_only, time_in_force_type):
     try:
         if wallet is None:
             wallet = await Wallet.from_mnemonic(node, API_KEY.strip(), WALLET_ADDRESS.strip())
@@ -69,12 +70,13 @@ async def place_market_order(node, indexer, wallet, market, side, size, price, r
         market_data = m_data["markets"][market]
         oracle_price = float(market_data["oraclePrice"])
         market_obj = Market(market_data)
+        step_size = float(market_data["stepSize"])
 
         if side == "BUY":
-            execution_price = oracle_price * 1.1
+            execution_price = float(oracle_price * 1.05)
             dydx_side = Order.Side.SIDE_BUY
         else:
-            execution_price = 0
+            execution_price = float(oracle_price * 0.95)
             dydx_side = Order.Side.SIDE_SELL
 
         # 4. Configurar IDs
@@ -94,12 +96,12 @@ async def place_market_order(node, indexer, wallet, market, side, size, price, r
             side=dydx_side,
             size=float(size),
             price=execution_price,
-            time_in_force=Order.TimeInForce.TIME_IN_FORCE_UNSPECIFIED,
+            time_in_force=time_in_force_type,
             reduce_only=reduce_only,
             good_til_block=current_block + 20,
         )
 
-        print(f">>> [TX] Enviando {side} {market} Size: {size} Price: {execution_price}...")
+        print(f">>> [TX] Enviando {side} {market} Size: {size} Price: {price}...")
 
         # 6. Enviar transacción
         transaction = await node.place_order(
@@ -224,3 +226,99 @@ async def abort_all_positions(node, indexer):
 
     print("All positions closed.")
     return closed_markets
+
+
+async def get_real_fill_details(indexer, client_id, market, max_retries=5):
+    """
+    Consulta el Indexer para saber el estado FINAL y el tamaño REAL ejecutado.
+    CORREGIDO: Suma fills reales si la orden fue CANCELADA (IOC).
+    """
+
+    await asyncio.sleep(2)  # Espera inicial vital
+
+    for _ in range(max_retries):
+        try:
+            # Buscamos la orden
+            orders_resp = await indexer.account.get_subaccount_orders(
+                address=WALLET_ADDRESS,
+                subaccount_number=0,
+                limit=10,
+                ticker=market
+            )
+            orders = orders_resp if isinstance(orders_resp, list) else orders_resp.get("orders", [])
+
+            target_order = None
+            for o in orders:
+                if str(o.get("clientId")) == str(client_id):
+                    target_order = o
+                    break
+
+            if target_order:
+                # --- AQUÍ EMPIEZA LA CORRECCIÓN ---
+                status = target_order.get("status")
+                original_size = float(target_order.get("size", 0))
+                order_id = target_order.get("id")  # Necesitamos el ID del servidor
+
+                filled_size = 0.0
+
+                # LÓGICA HÍBRIDA:
+                if status == "CANCELED":
+                    # Si está cancelada (típico de IOC parcial), remainingSize miente.
+                    # Hay que pedir los FILLS explícitamente.
+                    try:
+                        # Nota: Ajusta los parámetros según tu versión exacta del SDK de dYdX
+                        fills_resp = await indexer.account.get_subaccount_fills(
+                            address=WALLET_ADDRESS,
+                            subaccount_number=0,
+                            ticker=market,
+                            limit=20
+                        )
+                        all_fills = fills_resp if isinstance(fills_resp, list) else fills_resp.get("fills", [])
+
+                        # 2. Filtramos en Python los fills que pertenecen a NUESTRA order_id
+                        # (Convertimos a string ambos para asegurar comparación correcta)
+                        my_fills = [f for f in all_fills if str(f.get("orderId")) == str(order_id)]
+
+                        # 3. Sumamos lo que realmente se ejecutó
+                        filled_size = sum(float(f.get("size", 0)) for f in my_fills)
+
+                    except Exception as e:
+                        print(f"Error obteniendo fills: {e}. Asumiendo 0.")
+                        filled_size = 0.0
+                else:
+                    # Si es FILLED u OPEN, la resta matemática suele funcionar bien
+                    remaining = float(target_order.get("remainingSize", 0))
+                    filled_size = original_size - remaining
+
+                # ----------------------------------
+
+                # Determinamos etiqueta humana
+                fill_status = "UNKNOWN"
+                print(f"STATUS = {status}")
+
+                if status == "FILLED":
+                    fill_status = "FILLED"
+                elif status == "CANCELED":
+                    if filled_size > 0:
+                        fill_status = "PARTIALLY_FILLED_IOC"
+                    else:
+                        fill_status = "KILLED_BY_FOK"
+                else:
+                    fill_status = status
+
+                return {
+                    "found": True,
+                    "status_label": fill_status,
+                    "raw_status": status,
+                    "filled_size": filled_size,
+                    "filled_usd_est": filled_size * float(target_order.get("price", 0))  # Aprox
+                }
+            else:
+                print(f".", end="", flush=True)
+                await asyncio.sleep(1)  # Espera antes de reintentar si no encuentra orden
+
+        except Exception as e:
+            print(f"Error polling order: {e}")
+            await asyncio.sleep(1)
+
+    return {"found": False, "status_label": "NOT_FOUND", "filled_size": 0, "filled_usd_est": 0}

@@ -9,6 +9,9 @@ ABORT_ALL_POSITIONS= False
 # Find cointegrated pairs
 FIND_COINTEGRATED = False
 
+# Manage exits
+MANAGE_EXITS = True
+
 # Place Trades
 PLACE_TRADES = True
 
@@ -21,8 +24,8 @@ WINDOW = 21
 # Thresholds - Opening
 MAX_HALF_LIFE = 24
 ZSCORE_THRESH = 1.5
-USD_PER_TRADE = 1000
-USD_MIN_COLLATERAL = 20000 #CLOSE TO BALANCE
+USD_PER_TRADE = 3000
+USD_MIN_COLLATERAL = 10000 #CLOSE TO BALANCE
 
 # Thresholds - Closing
 CLOSE_AT_ZSCORE_CROSS = True

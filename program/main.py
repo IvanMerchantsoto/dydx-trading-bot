@@ -8,7 +8,8 @@ from func_cointegration import store_cointegration_results
 from constants import (
 ABORT_ALL_POSITIONS,
 FIND_COINTEGRATED,
-PLACE_TRADES
+PLACE_TRADES,
+MANAGE_EXITS
 )
 
 async def main():
@@ -49,6 +50,15 @@ async def main():
                 exit(1)
         except Exception as e:
             print("Error cointegrating pairs: ", e)
+            exit(1)
+
+        # Manage exits
+    if MANAGE_EXITS:
+        try:
+            print("Managing exits...")
+            await manage_trade_exits(node, indexer, wallet)
+        except Exception as e:
+            print("Error managing exiting positions: ", e)
             exit(1)
 
     # Store cointegrated pairs

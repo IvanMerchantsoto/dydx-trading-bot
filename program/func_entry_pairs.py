@@ -91,86 +91,12 @@ async def open_positions(node, indexer, wallet):
 
                     # Get acceptable price in string format with correct number of decimals
 
-                    """
-                    base_price = series_1[-1]
-                    quote_price = series_2[-1]
-                    accept_base_price = float(base_price) * 1.01 if z_score < 0 else float(base_price) * 0.99
-                    accept_quote_price = float(quote_price) * 1.01 if z_score > 0 else float(quote_price) * 0.99
-                    failsafe_base_price = float(base_price) * 0.05 if z_score < 0 else float(base_price) * 1.7
-                    base_tick_size = markets[base_market]["tickSize"]
-                    quote_tick_size = markets[quote_market]["tickSize"]
-
-                    # Format prices
-                    accept_base_price = format_number(accept_base_price, base_tick_size)
-                    accept_quote_price = format_number(accept_quote_price, quote_tick_size)
-                    accept_failsafe_base_price = format_number(failsafe_base_price, base_tick_size)
-
-                    # Get size
-                    base_quantity = 1 / base_price * USD_PER_TRADE
-                    quote_quantity = 1 / quote_price * USD_PER_TRADE
-                    
-                
-                    base_step_size = markets[base_market]["stepSize"]
-                    quote_step_size = markets[quote_market]["stepSize"]
-
-                    # Format sizes
-                    base_size = format_number(base_quantity, base_step_size)
-                    quote_size = format_number(quote_quantity, quote_step_size)
-
-                    # Ensure size
-                    base_min_order_size = markets[base_market].get("minSize")
-                    quote_min_order_size = markets[quote_market].get("minSize")
-
-                    def get_min_size(market_data):
-                        return (market_data.get("minOrderSize") or
-                                market_data.get("minSize") or
-                                market_data.get("clobPair", {}).get("minOrderSize") or
-                                market_data.get("stepSize"))
-
-                    base_min_order_size = get_min_size(markets[base_market])
-                    quote_min_order_size = get_min_size(markets[quote_market])
-
-                    if base_min_order_size is None or quote_min_order_size is None:
-                        print(f"Skipping {base_market}/{quote_market}: No min size detected.")
-                        continue
-
-                    check_base = float(base_quantity) > float(base_min_order_size)
-                    check_quote = float(quote_quantity) > float(quote_min_order_size)
-
-                    # If checks pass, place trades
-                    if check_base and check_quote:
-
-                        # Check account balance
-                        account_resp = await indexer.account.get_subaccount(WALLET_ADDRESS, 0)
-                        subaccount = account_resp.get("subaccount")
-
-                        if subaccount:
-                            free_collateral = float(subaccount.get("freeCollateral", 0))
-                            print(f"Balance: {free_collateral} | Mín required: {USD_MIN_COLLATERAL}")
-                        else:
-                            print("Error obtaining account balance.")
-                            continue
-
-
-                        # Guard: Ensure collateral
-                        if free_collateral < USD_MIN_COLLATERAL:
-                            break
-                    """
-
                     base_quantity = USD_PER_TRADE / base_price
-                    #quote_quantity = (USD_PER_TRADE * hedge_ratio) / quote_price
-                    quote_quantity = base_quantity*hedge_ratio
+                    quote_quantity = USD_PER_TRADE / quote_price
 
                     base_size_fmt = format_number(base_quantity, base_step)
                     quote_size_fmt = format_number(quote_quantity, quote_step)
 
-                    # --- DEBUG DE MATEMÁTICAS (Para ver por qué no cuadran los montos) ---
-                    print(f"\n📐 MATH DEBUG [{base_market} / {quote_market}]")
-                    print(f"   Precios: {base_market}=${base_price} | {quote_market}=${quote_price}")
-                    print(f"   Hedge Ratio: {hedge_ratio}")
-                    print(f"   Base Qty: {base_quantity} -> Formateado: {base_size_fmt} (Step: {base_step})")
-                    print(f"   Quote Qty: {quote_quantity} -> Formateado: {quote_size_fmt} (Step: {quote_step})")
-                    # -------------------------------------------------------------------
 
                     if base_side == "BUY":
                         failsafe_p = base_price * 1.02
@@ -183,7 +109,7 @@ async def open_positions(node, indexer, wallet):
                         print(f"Saltando {base_market}/{quote_market}: Tamaño muy pequeño para el mínimo del exchange.")
                         continue
 
-                    print(f"Opening trade for {base_market} and {quote_market}...")
+                    print(f"\n\nOpening trade for {base_market} and {quote_market}...")
 
                         # Create Bot Agent
                     bot_agent = BotAgent(

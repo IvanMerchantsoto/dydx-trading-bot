@@ -1,0 +1,36 @@
+[
+  {
+    "market_1": "ETH-USD",
+    "market_2": "LTC-USD",
+    "hedge_ratio": 39.790774924143584,
+    "z_score": -1.6315933981005306,
+    "half_life": 6.0,
+    "order_id_m1": "516520219",
+    "order_m1_size": "0.907",
+    "order_m1_side": "BUY",
+    "order_time_m1": "2026-01-17T17:46:11.352801",
+    "order_id_m2": "3724725057",
+    "order_m2_size": "40.1",
+    "order_m2_side": "SELL",
+    "order_time_m2": "2026-01-17T17:46:16.997635",
+    "pair_status": "LIVE",
+    "comments": ""
+  },
+  {
+    "market_1": "LINK-USD",
+    "market_2": "TIA-USD",
+    "hedge_ratio": 24.1376570888051,
+    "z_score": 2.7197980957942223,
+    "half_life": 12.0,
+    "order_id_m1": "1186966117",
+    "order_m1_size": "218.5",
+    "order_m1_side": "SELL",
+    "order_time_m1": "2026-01-17T17:47:55.043164",
+    "order_id_m2": "1132874963",
+    "order_m2_size": "5199.1",
+    "order_m2_side": "BUY",
+    "order_time_m2": "2026-01-17T17:48:00.860619",
+    "pair_status": "LIVE",
+    "comments": ""
+  }
+]

@@ -1,6 +1,7 @@
 import random
 import time
 import asyncio
+import json
 
 from dydx_v4_client import MAX_CLIENT_ID, OrderFlags
 from dydx_v4_client.indexer.rest.constants import OrderType
@@ -223,6 +224,11 @@ async def abort_all_positions(node, indexer):
 
     except Exception as e:
         print(f"Error closing positions: {e}")
+
+    # Override json file with empty trades
+    bot_agents = []
+    with open("bot_agents.json", "w") as f:
+        json.dump(bot_agents, f)
 
     print("All positions closed.")
     return closed_markets

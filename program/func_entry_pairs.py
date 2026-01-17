@@ -7,6 +7,9 @@ from constants import WALLET_ADDRESS
 from func_bot_agent import BotAgent
 import pandas as pd
 import json
+import os
+
+JSON_PATH = os.path.join(os.path.dirname(__file__), "bot_agents.json")
 
 from pprint import pprint
 
@@ -28,14 +31,16 @@ async def open_positions(node, indexer, wallet):
     # Initialize container for BotAgent results
     bot_agents = []
 
-        # Opening JSON file
-        #try:
-            #open_positions_file = open("bot_agents.json")
-            #open_positions_dict = json.load(open_positions_file)
-            #for p in open_positions_dict:
-                #bot_agents.append(p)
-        #except:
-            #bot_agents = []
+    # Opening JSON file
+    try:
+        open_positions_file = open("bot_agents.json")
+        open_positions_dict = json.load(open_positions_file)
+        for p in open_positions_dict:
+            bot_agents.append(p)
+
+        pprint(bot_agents)
+    except:
+        bot_agents = []
 
     for index, row in df.iterrows():
 
@@ -134,13 +139,16 @@ async def open_positions(node, indexer, wallet):
 
                     if bot_open_dict != "failed" and bot_open_dict.get("pair_status") == "LIVE":
                         bot_agents.append(bot_open_dict)
+                        with open(JSON_PATH, "w") as f:
+                            json.dump(bot_agents, f, indent=2)
+                        print(f"Saved JSON -> {JSON_PATH} ({len(bot_agents)} items)")
                         print(f"Trade LIVE: {base_market} {base_side} @ {base_price} & {quote_market} {quote_side} @ {quote_price}")
                     else:
                         reason = bot_open_dict.get("comments", "Unknown Error")
                         print(f"⚠️ Trade FAILED for {base_market}/{quote_market}. Reason: {reason}")
 
-        # Save agents
-        #print(f"Success: Manage open trades checked.")
+    # Save agents
+    print(f"Success: Manage open trades checked.")
     if len(bot_agents) > 0:
         with open("bot_agents.json", "w") as f:
             json.dump(bot_agents, f)

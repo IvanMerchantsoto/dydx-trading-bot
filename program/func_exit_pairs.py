@@ -1,197 +1,170 @@
-from constants import CLOSE_AT_ZSCORE_CROSS
+from constants import CLOSE_AT_ZSCORE_CROSS, WALLET_ADDRESS
 from func_utils import format_number
 from func_public import get_candles_recent
 from func_cointegration import calculate_zscore
 from func_private import place_market_order
+from v4_proto.dydxprotocol.clob.order_pb2 import Order
 import json
-import time
+import asyncio
 
 from pprint import pprint
 
 # Manage trade exits
-def manage_trade_exits(client):
+async def manage_trade_exits(node, indexer, wallet):
 
   """
     Manage exiting open positions
     Based upon criteria set in constants
   """
 
-  # Initialize saving output
+  # -----------------------------
+  # Load saved open trades
+  # -----------------------------
+  try:
+      with open("bot_agents.json", "r") as f:
+          open_positions_dict = json.load(f)
+  except Exception:
+      return "complete"
+
+  if not open_positions_dict:
+      return "complete"
+
+  # -----------------------------
+  # Pull market metadata once (tickSize, oraclePrice)
+  # -----------------------------
+  markets_resp = await indexer.markets.get_perpetual_markets()
+  markets = markets_resp.get("markets", {})
+
+  # -----------------------------
+  # Pull live open positions once
+  # -----------------------------
+  try:
+      account_resp = await indexer.account.get_subaccount(WALLET_ADDRESS, 0)
+      subaccount = account_resp.get("subaccount", {})
+      positions = subaccount.get("openPerpetualPositions", {}) or subaccount.get("perpetualPositions", {})
+  except Exception as e:
+      print(f"Error reading subaccount positions: {e}")
+      return "error"
+
+  # Only markets with non-zero size
+  live_pos = {}
+  for m, pdata in (positions or {}).items():
+      try:
+          sz = float(pdata.get("size", 0))
+      except Exception:
+          sz = 0.0
+      if abs(sz) > 0:
+          live_pos[m] = sz
+
   save_output = []
 
-  # Opening JSON file
-  try:
-    open_positions_file = open("bot_agents.json")
-    open_positions_dict = json.load(open_positions_file)
-  except:
-    return "complete"
+  # -----------------------------
+  # Loop saved pairs
+  # -----------------------------
 
-  # Guard: Exit if no open positions in file
-  if len(open_positions_dict) < 1:
-    return "complete"
-
-  # Get all open positions per trading platform
-  exchange_pos = client.private.get_positions(status="OPEN")
-  all_exc_pos = exchange_pos.data["positions"]
-  markets_live = []
-  for p in all_exc_pos:
-    markets_live.append(p["market"])
-
-  # Protect API
-  time.sleep(0.5)
-
-  # Check all saved positions match order record
-  # Exit trade according to any exit trade rules
   for position in open_positions_dict:
+      is_close = False
 
-    # Initialize is_close trigger
-    is_close = False
+      m1 = position.get("market_1")
+      m2 = position.get("market_2")
 
-    # Extract position matching information from file - market 1
-    position_market_m1 = position["market_1"]
-    position_size_m1 = position["order_m1_size"]
-    position_side_m1 = position["order_m1_side"]
+      if not m1 or not m2:
+          save_output.append(position)
+          continue
 
-    # Extract position matching information from file - market 2
-    position_market_m2 = position["market_2"]
-    position_size_m2 = position["order_m2_size"]
-    position_side_m2 = position["order_m2_side"]
+      # Guard: both markets still open on exchange
+      if m1 not in live_pos or m2 not in live_pos:
+          print(f"Warning: One leg not live anymore for {m1}/{m2}. Keeping record for review.")
+          save_output.append(position)
+          continue
 
-    # Protect API
-    time.sleep(0.5)
+      # -----------------------------
+      # Z-score close logic
+      # -----------------------------
+      if CLOSE_AT_ZSCORE_CROSS:
+          hedge_ratio = float(position.get("hedge_ratio", 0))
+          z_score_traded = float(position.get("z_score", 0))
 
-    # Get order info m1 per exchange
-    order_m1 = client.private.get_order_by_id(position["order_id_m1"])
-    order_market_m1 = order_m1.data["order"]["market"]
-    order_size_m1 = order_m1.data["order"]["size"]
-    order_side_m1 = order_m1.data["order"]["side"]
+          series_1 = await get_candles_recent(indexer, m1)
+          series_2 = await get_candles_recent(indexer, m2)
 
-    # Protect API
-    time.sleep(0.5)
+          if len(series_1) > 0 and len(series_1) == len(series_2):
+              spread = series_1 - (hedge_ratio * series_2)
+              z_score_current = float(calculate_zscore(spread).values.tolist()[-1])
 
-    # Get order info m2 per exchange
-    order_m2 = client.private.get_order_by_id(position["order_id_m2"])
-    order_market_m2 = order_m2.data["order"]["market"]
-    order_size_m2 = order_m2.data["order"]["size"]
-    order_side_m2 = order_m2.data["order"]["side"]
+              z_score_level_check = abs(z_score_current) >= abs(z_score_traded)
+              z_score_cross_check = (
+                      (z_score_current < 0 and z_score_traded > 0) or
+                      (z_score_current > 0 and z_score_traded < 0)
+              )
 
-    # Perform matching checks
-    check_m1 = position_market_m1 == order_market_m1 and position_size_m1 == order_size_m1 and position_side_m1 == order_side_m1
-    check_m2 = position_market_m2 == order_market_m2 and position_size_m2 == order_size_m2 and position_side_m2 == order_side_m2
-    check_live = position_market_m1 in markets_live and position_market_m2 in markets_live
+              if z_score_level_check and z_score_cross_check:
+                  is_close = True
 
-    # Guard: If not all match exit with error
-    if not check_m1 or not check_m2 or not check_live:
-      print(f"Warning: Not all open positions match exchange records for {position_market_m1} and {position_market_m2}")
-      continue
+      # -----------------------------
+      # If not closing, keep record
+      # -----------------------------
+      if not is_close:
+          save_output.append(position)
+          continue
 
-    # Get prices
-    series_1 = get_candles_recent(client, position_market_m1)
-    time.sleep(0.2)
-    series_2 = get_candles_recent(client, position_market_m2)
-    time.sleep(0.2)
-
-    # Get markets for reference of tick size
-    markets = client.public.get_markets().data
-
-    # Protect API
-    time.sleep(0.2)
-
-    # Trigger close based on Z-Score
-    if CLOSE_AT_ZSCORE_CROSS:
-
-      # Initialize z_scores
-      hedge_ratio = position["hedge_ratio"]
-      z_score_traded = position["z_score"]
-      if len(series_1) > 0 and len(series_1) == len(series_2):
-        spread = series_1 - (hedge_ratio * series_2)
-        z_score_current = calculate_zscore(spread).values.tolist()[-1]
-
-      # Determine trigger
-      z_score_level_check = abs(z_score_current) >= abs(z_score_traded)
-      z_score_cross_check = (z_score_current < 0 and z_score_traded > 0) or (z_score_current > 0 and z_score_traded < 0)
-
-      # Close trade
-      if z_score_level_check and z_score_cross_check:
-
-        # Initiate close trigger
-        is_close = True
-
-    ###
-    # Add any other close logic you want here
-    # Trigger is_close
-    ###
-
-    # Close positions if triggered
-    if is_close:
-
-      # Determine side - m1
-      side_m1 = "SELL"
-      if position_side_m1 == "SELL":
-        side_m1 = "BUY"
-
-      # Determine side - m2
-      side_m2 = "SELL"
-      if position_side_m2 == "SELL":
-        side_m2 = "BUY"
-
-      # Get and format Price
-      price_m1 = float(series_1[-1])
-      price_m2 = float(series_2[-1])
-      accept_price_m1 = price_m1 * 1.05 if side_m1 == "BUY" else price_m1 * 0.95
-      accept_price_m2 = price_m2 * 1.05 if side_m2 == "BUY" else price_m2 * 0.95
-      tick_size_m1 = markets["markets"][position_market_m1]["tickSize"]
-      tick_size_m2 = markets["markets"][position_market_m2]["tickSize"]
-      accept_price_m1 = format_number(accept_price_m1, tick_size_m1)
-      accept_price_m2 = format_number(accept_price_m2, tick_size_m2)
-
-      # Close positions
+      # -----------------------------
+      # Close both legs (reduce-only)
+      # We close using ACTUAL current position size from live_pos (more reliable than stored order size).
+      # -----------------------------
       try:
+          # Leg 1
+          size_m1 = float(live_pos[m1])
+          close_side_m1 = "SELL" if size_m1 > 0 else "BUY"  # long -> sell, short -> buy
+          close_size_m1 = abs(size_m1)
 
-        # Close position for market 1
-        print(">>> Closing market 1 <<<")
-        print(f"Closing position for {position_market_m1}")
+          # Leg 2
+          size_m2 = float(live_pos[m2])
+          close_side_m2 = "SELL" if size_m2 > 0 else "BUY"
+          close_size_m2 = abs(size_m2)
 
-        close_order_m1 = place_market_order(
-          client,
-          market=position_market_m1,
-          side=side_m1,
-          size=position_size_m1,
-          price=accept_price_m1,
-          reduce_only=True,
-        )
+          # Optional: format sizes to stepSize (safer)
+          step_m1 = markets.get(m1, {}).get("stepSize")
+          step_m2 = markets.get(m2, {}).get("stepSize")
+          if step_m1:
+              close_size_m1 = float(format_number(close_size_m1, step_m1))
+          if step_m2:
+              close_size_m2 = float(format_number(close_size_m2, step_m2))
 
-        print(close_order_m1["order"]["id"])
-        print(">>> Closing <<<")
+          print(f"\n>>> Closing pair: {m1} & {m2}")
+          print(f"Leg1 close: {close_side_m1} {m1} size={close_size_m1}")
+          print(f"Leg2 close: {close_side_m2} {m2} size={close_size_m2}")
 
-        # Protect API
-        time.sleep(1)
+          # NOTE: Your current place_market_order uses oraclePrice internally for execution price (failsafe),
+          # and enforces IOC + reduce_only. :contentReference[oaicite:7]{index=7} :contentReference[oaicite:8]{index=8}
+          await place_market_order(
+              node, indexer, wallet,
+              m1, close_side_m1, close_size_m1, markets[m1]["oraclePrice"],
+              True,  # reduce_only
+              time_in_force_type=Order.TimeInForce.TIME_IN_FORCE_IOC
+          )
 
-        # Close position for market 2
-        print(">>> Closing market 2 <<<")
-        print(f"Closing position for {position_market_m2}")
+          # small spacing to avoid rate limits
+          await asyncio.sleep(0.5)
 
-        close_order_m2 = place_market_order(
-          client,
-          market=position_market_m2,
-          side=side_m2,
-          size=position_size_m2,
-          price=accept_price_m2,
-          reduce_only=True,
-        )
+          await place_market_order(
+              node, indexer, wallet,
+              m2, close_side_m2, close_size_m2, markets[m2]["oraclePrice"],
+              True,  # reduce_only
+              time_in_force_type=Order.TimeInForce.TIME_IN_FORCE_IOC
+          )
 
-        print(close_order_m2["order"]["id"])
-        print(">>> Closing <<<")
+          print(">>> Closed both legs (reduce-only).")
 
       except Exception as e:
-        print(f"Exit failed for {position_market_m1} with {position_market_m2}")
-        save_output.append(position)
+          print(f"Exit failed for {m1} with {m2}: {e}")
+          save_output.append(position)
 
-    # Keep record if items and save
-    else:
-      save_output.append(position)
-
-  # Save remaining items
+      # -----------------------------
+      # Save remaining items
+      # -----------------------------
   print(f"{len(save_output)} Items remaining. Saving file...")
   with open("bot_agents.json", "w") as f:
-    json.dump(save_output, f)
+      json.dump(save_output, f)
+
+  return "complete"

@@ -5,6 +5,7 @@ from func_private import abort_all_positions
 from func_public import construct_market_prices
 from func_entry_pairs import open_positions
 from func_cointegration import store_cointegration_results
+from func_exit_pairs import manage_trade_exits
 from constants import (
 ABORT_ALL_POSITIONS,
 FIND_COINTEGRATED,
@@ -52,23 +53,24 @@ async def main():
             print("Error cointegrating pairs: ", e)
             exit(1)
 
-        # Manage exits
-    if MANAGE_EXITS:
-        try:
-            print("Managing exits...")
-            await manage_trade_exits(node, indexer, wallet)
-        except Exception as e:
-            print("Error managing exiting positions: ", e)
-            exit(1)
+    while True:
+            # Manage exits
+        if MANAGE_EXITS:
+            try:
+                print("Managing exits...")
+                await manage_trade_exits(node, indexer, wallet)
+            except Exception as e:
+                print("Error managing exiting positions: ", e)
+                exit(1)
 
-    # Store cointegrated pairs
-    if PLACE_TRADES:
-        try:
-            print("Finding trading opportunities...")
-            await open_positions(node, indexer, wallet)
-        except Exception as e:
-            print("Error trading pairs: ", e)
-            exit(1)
+        # Store cointegrated pairs
+        if PLACE_TRADES:
+            try:
+                print("Finding trading opportunities...")
+                await open_positions(node, indexer, wallet)
+            except Exception as e:
+                print("Error trading pairs: ", e)
+                exit(1)
 
 
 if __name__ == "__main__":

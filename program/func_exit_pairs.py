@@ -1,3 +1,4 @@
+from func_messaging import send_message
 from constants import CLOSE_AT_ZSCORE_CROSS, WALLET_ADDRESS
 from func_utils import format_number
 from func_public import get_candles_recent
@@ -155,9 +156,11 @@ async def manage_trade_exits(node, indexer, wallet):
           )
 
           print(">>> Closed both legs (reduce-only).")
+          send_message(">>> Closed both legs (reduce-only).")
 
       except Exception as e:
           print(f"Exit failed for {m1} with {m2}: {e}")
+          send_message(f"Exit failed for {m1} with {m2}: {e}")
           save_output.append(position)
 
       # -----------------------------

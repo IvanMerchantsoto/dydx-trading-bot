@@ -1,3 +1,4 @@
+from func_messaging import send_message
 from constants import ZSCORE_THRESH, USD_PER_TRADE, USD_MIN_COLLATERAL
 from func_utils import format_number
 from func_public import get_candles_recent
@@ -143,6 +144,7 @@ async def open_positions(node, indexer, wallet):
                             json.dump(bot_agents, f, indent=2)
                         print(f"Saved JSON -> {JSON_PATH} ({len(bot_agents)} items)")
                         print(f"Trade LIVE: {base_market} {base_side} @ {base_price} & {quote_market} {quote_side} @ {quote_price}")
+                        send_message(f"Trade LIVE: {base_market} {base_side} / {quote_market} {quote_side}")
                     else:
                         reason = bot_open_dict.get("comments", "Unknown Error")
                         print(f"⚠️ Trade FAILED for {base_market}/{quote_market}. Reason: {reason}")

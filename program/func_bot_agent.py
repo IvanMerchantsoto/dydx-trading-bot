@@ -1,5 +1,6 @@
 from func_private import place_market_order, check_order_status, get_real_fill_details
 from datetime import datetime
+from func_messaging import send_message
 import asyncio
 from v4_proto.dydxprotocol.clob.order_pb2 import Order
 

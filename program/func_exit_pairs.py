@@ -356,7 +356,7 @@ async def manage_trade_exits(node, indexer, wallet):
     # Save remaining items (AFTER loop)
     # -----------------------------
     print(f"{len(save_output)} Items remaining. Saving file...")
-    send_message(f"{len(save_output)} Items remaining. Saving file...)
+    send_message(f"{len(save_output)} Items remaining. Saving file...")
     with open(JSON_PATH, "w") as f:
         json.dump(save_output, f, indent=2)
 

@@ -180,9 +180,15 @@ async def manage_trade_exits(node, indexer, wallet):
         try:
             series_1 = await get_candles_recent(indexer, m1)
             series_2 = await get_candles_recent(indexer, m2)
-            if len(series_1) > 0 and len(series_1) == len(series_2):
+
+            n = min(len(series_1), len(series_2))
+            if n > 10:
+                series_1 = series_1[-n:]
+                series_2 = series_2[-n:]
                 spread = series_1 - (hedge_ratio * series_2)
                 z_now = float(calculate_zscore(spread).values.tolist()[-1])
+            else:
+                z_now = None
         except Exception as e:
             print(f"Error computing z-score for {m1}/{m2}: {e}")
             z_now = None

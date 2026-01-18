@@ -47,7 +47,7 @@ MANAGE_EXITS = True
 PLACE_TRADES = True
 
 # Resolution
-RESOLUTION = "5MIN"
+RESOLUTION = "1HOUR"
 
 # Status Window (days)
 WINDOW = 21

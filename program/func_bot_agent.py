@@ -157,57 +157,88 @@ class BotAgent:
 
         print(f" Report M2: {status_m2} | Real fill: {real_filled_m2}")
 
-        # 3) FLATTEN (si M2 no alcanzó a cubrir el USD de M1)
-        filled_usd_2 = real_filled_m2 * quote_px  # notional aproximado de M2
+        # Hard fail if M2 didn't actually open
+        if real_filled_m2 <= 0 or status_m2 in ("NOT_FOUND", "FAILED", "CANCELED"):
+            self.order_dict["pair_status"] = "FAILED"
+            self.order_dict["comments"] = f"M2 not executed: status={status_m2}, fill={real_filled_m2}"
 
+            # Optional: flatten M1 fully since hedge failed
+            try:
+                close_side_m1 = "SELL" if self.base_side == "BUY" else "BUY"
+                await place_market_order(
+                    self.node, self.indexer, wallet,
+                    self.market_1, close_side_m1, real_filled_m1, self.base_price,
+                    True,
+                    time_in_force_type=Order.TimeInForce.TIME_IN_FORCE_IOC
+                )
+                self.order_dict["comments"] += " | Flattened M1 fully due to M2 failure."
+            except Exception as e:
+                self.order_dict["pair_status"] = "ERROR"
+                self.order_dict["comments"] += f" | Flatten M1 failed: {e}"
+
+            return self.order_dict
+
+        # =========================================================
+        # 3) RESIDUAL CHECK + FLATTEN (if needed)
+        # =========================================================
+
+        filled_usd_2 = real_filled_m2 * quote_px
         residual_usd = filled_usd_1 - filled_usd_2
         effective_usd = min(filled_usd_1, filled_usd_2)
         tol = max(2.0, 0.02 * effective_usd)
+
+        self.order_dict["residual_usd"] = float(residual_usd)
+        self.order_dict["residual_tol"] = float(tol)
 
         print(f" Residual after M2: ${residual_usd:.2f} (tol ${tol:.2f})")
 
         if abs(residual_usd) > tol:
             print(" Residual too large -> FLATTEN with reduce-only IOC")
+            self.order_dict["flattened"] = True
 
             try:
                 if residual_usd > 0:
-                    # M1 quedó más grande que M2 -> recorta M1 (reduce-only)
+                    # M1 larger -> reduce M1
                     size_to_close_m1 = residual_usd / base_px if base_px > 0 else 0.0
                     close_side_m1 = "SELL" if self.base_side == "BUY" else "BUY"
 
                     await place_market_order(
                         self.node, self.indexer, wallet,
                         self.market_1, close_side_m1, size_to_close_m1, self.base_price,
-                        True,  # reduce_only=True
+                        True,
                         time_in_force_type=Order.TimeInForce.TIME_IN_FORCE_IOC
                     )
-
                     self.order_dict["comments"] = f"Flattened residual by reducing M1 ~${residual_usd:.2f}"
 
                 else:
-                    # M2 quedó más grande que M1 -> recorta M2 (reduce-only)
+                    # M2 larger -> reduce M2
                     size_to_close_m2 = (-residual_usd) / quote_px if quote_px > 0 else 0.0
                     close_side_m2 = "SELL" if self.quote_side == "BUY" else "BUY"
 
                     await place_market_order(
                         self.node, self.indexer, wallet,
                         self.market_2, close_side_m2, size_to_close_m2, self.quote_price,
-                        True,  # reduce_only=True
+                        True,
                         time_in_force_type=Order.TimeInForce.TIME_IN_FORCE_IOC
                     )
-
                     self.order_dict["comments"] = f"Flattened residual by reducing M2 ~${-residual_usd:.2f}"
 
             except Exception as e:
-                # Si el flatten falla, prefiero marcarlo como ERROR porque quedas direccional
                 print(f" ERROR Flattening residual: {e}")
                 self.order_dict["pair_status"] = "ERROR"
                 self.order_dict["comments"] = f"Flatten fail: {e}"
                 return self.order_dict
 
+            # ✅ After flatten, treat as NOT a valid LIVE pair-trade (you wanted "no deal")
+            # because you no longer have a clean hedged pair.
+            self.order_dict["pair_status"] = "FAILED"
+            self.order_dict["comments"] = (self.order_dict["comments"] or "") + " | Not saving as LIVE (flattened)."
+            return self.order_dict
+
         # =========================================================
-        # DONE
+        # DONE: hedge is good -> LIVE
         # =========================================================
         self.order_dict["pair_status"] = "LIVE"
+        self.order_dict["comments"] = self.order_dict["comments"] or "OK"
         return self.order_dict
 

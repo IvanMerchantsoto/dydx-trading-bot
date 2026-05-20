@@ -193,12 +193,32 @@ WINDOW = 21
 # Thresholds - Opening
 MAX_HALF_LIFE = 24
                        # El exit por Z_SL y HARD_SL gestiona el riesgo de tardanza
-ZSCORE_THRESH = 1.5
+ZSCORE_THRESH = 2.0    # Subido de 1.5 → mejor R:R (en z=1.5 R:R=0.53, en z=2.0 R:R=0.87+)
 USD_PER_TRADE = 1000
 USD_MIN_COLLATERAL = 7000
 
 # Thresholds - Closing
 CLOSE_AT_ZSCORE_CROSS = True
+
+# ===== Trailing Take-Profit =====
+# En lugar de cerrar el TP en z=Z_TP fijo, se sigue el spread hasta el peak
+# y se cierra cuando rebota TRAIL_Z_PULLBACK unidades desde el mejor z visto.
+# Esto captura más del overshoot natural de spreads cointegrados.
+#
+# Ejemplo: entramos a z=2.0. Z baja a 0.3 (best_z=0.3), luego rebota a 0.6:
+#   → cerramos en 0.6 en lugar de 0.7 → capturamos 1.4 unidades en vez de 1.3
+# Ejemplo: Z baja a 0.1 (floor_hit=True) → cerramos inmediatamente sin esperar rebote.
+TRAIL_TP_ENABLED = True
+TRAIL_Z_PULLBACK = 0.3   # cerrar cuando |z| rebota 0.3 desde el mejor z visto
+TRAIL_Z_FLOOR = 0.15     # si |z| llega aquí, cerrar inmediatamente (no esperar rebote)
+
+# ===== Post-SL Cooldown =====
+# Cuando Z_SL o HARD_SL cierra un par, se bloquea re-entrada por un mínimo de
+# SL_COOLDOWN_MIN_HOURS, o hasta half_life × SL_COOLDOWN_HALFLIFE_MULT (el mayor).
+# Evita el patrón observado: PENDLE/ETHFI cerrado por SL y re-abierto 9 min después.
+SL_COOLDOWN_ENABLED = True
+SL_COOLDOWN_MIN_HOURS = 2.0          # mínimo 2h de cooldown tras SL
+SL_COOLDOWN_HALFLIFE_MULT = 0.75     # o 75% del half_life si es mayor
 
 # Wallet Address
 WALLET_ADDRESS = "dydx1napkzyjp3rauk5p787r9sfhvs74r8e357a30n5"

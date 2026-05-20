@@ -12,6 +12,8 @@ from constants import (
     HARD_SL_USD, HARD_SL_PCT,
     TP_CONFIRM_CHECKS,
     MIN_HOLD_MINUTES_FOR_TP,
+    TRAIL_TP_ENABLED, TRAIL_Z_PULLBACK, TRAIL_Z_FLOOR,
+    SL_COOLDOWN_ENABLED, SL_COOLDOWN_MIN_HOURS, SL_COOLDOWN_HALFLIFE_MULT,
 )
 from func_utils import format_number
 from func_public import get_candles_recent
@@ -46,6 +48,55 @@ KEEP_RECONCILE_RECORDS = True
 
 # Fee estimation for close leg (taker 0.05% per leg)
 TAKER_FEE_BPS = 0.0005
+
+# ── Post-SL cooldown writer ───────────────────────────────────────────────────
+# Reutiliza el mismo pair_fail_cooldowns.json que usa func_entry_pairs.py,
+# añadiendo un campo "sl_cooldown_until" con timestamp ISO para bloquear re-entrada.
+_SL_COOLDOWN_PATH = os.path.join(os.path.dirname(__file__), "pair_fail_cooldowns.json")
+
+
+def _pair_key_exit(m1: str, m2: str) -> str:
+    return "/".join(sorted([str(m1), str(m2)]))
+
+
+def _write_sl_cooldown(m1: str, m2: str, half_life: float):
+    """Escribe un cooldown de re-entrada tras SL/HARD_SL para el par m1/m2."""
+    if not SL_COOLDOWN_ENABLED:
+        return
+    try:
+        try:
+            with open(_SL_COOLDOWN_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            data = {}
+
+        cooldown_hours = max(
+            float(SL_COOLDOWN_MIN_HOURS),
+            float(half_life) * float(SL_COOLDOWN_HALFLIFE_MULT) if half_life and half_life > 0 else 0.0
+        )
+        until_dt = datetime.now(timezone.utc).timestamp() + cooldown_hours * 3600.0
+        until_iso = datetime.fromtimestamp(until_dt, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+
+        key = _pair_key_exit(m1, m2)
+        rec = data.get(key, {})
+        rec["sl_cooldown_until"] = until_iso
+        rec["sl_cooldown_hours"] = round(cooldown_hours, 2)
+        rec["sl_ts"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        data[key] = rec
+
+        tmp = _SL_COOLDOWN_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, _SL_COOLDOWN_PATH)
+
+        log_event({
+            "type": "sl_cooldown_set",
+            "pair": key,
+            "cooldown_hours": round(cooldown_hours, 2),
+            "until": until_iso,
+        })
+    except Exception as e:
+        log_event({"type": "sl_cooldown_write_error", "pair": f"{m1}/{m2}", "error": str(e)})
 
 
 def _sf(x, d=0.0):
@@ -351,6 +402,14 @@ async def manage_trade_exits(node, indexer, wallet):
             z_now = None
             zcalc_error_count += 1
 
+        # ── Update best_z (lowest |z| seen since entry) ──────────────────
+        # Tracked continuously so trailing TP has the full picture.
+        if z_now is not None:
+            current_best_z = _sf(position.get("best_z", abs(z_now) + 99.0))
+            if abs(z_now) < current_best_z:
+                position["best_z"] = abs(z_now)
+            # (if z_now is None this loop, keep whatever best_z we had)
+
         # PnL calculation (proxy using oracle prices)
         can_pnl = _has_pnl_fields(position)
 
@@ -409,10 +468,33 @@ async def manage_trade_exits(node, indexer, wallet):
                     f"| pnl_gross={pnl_gross:.2f} | net_est={net_pnl_est:.2f}"
                 )
 
-        # ── 3. Take-Profit (z reversion + double confirmation + fee gate) ─
+        # ── 3. Take-Profit (z reversion + confirmation + fee gate) ──────────
+        # Trailing TP: sigue el spread hasta su peak y cierra en el pullback.
+        # Estándar: cierra cuando |z| ≤ Z_TP (umbral fijo).
         tp_zone = False
         if USE_Z_TP and (z_now is not None):
-            if USE_TP_HYSTERESIS:
+            if TRAIL_TP_ENABLED:
+                best_z_val = _sf(position.get("best_z", abs(z_now)))
+                # TP zone se activa cuando z ya llegó al umbral (best_z ≤ Z_TP)
+                # Y ahora ha rebotado TRAIL_Z_PULLBACK desde su mínimo.
+                in_tp_zone = best_z_val <= float(Z_TP)
+                # Floor: si z llegó muy cerca de 0, cerrar inmediatamente
+                floor_hit = best_z_val <= float(TRAIL_Z_FLOOR)
+                # Pullback: z ha subido TRAIL_Z_PULLBACK desde el mejor z
+                pulled_back = abs(z_now) >= best_z_val + float(TRAIL_Z_PULLBACK)
+                tp_zone = in_tp_zone and (pulled_back or floor_hit)
+                if tp_zone:
+                    log_event({
+                        "type": "trailing_tp_trigger",
+                        "trace_id": trace_id,
+                        "m1": m1, "m2": m2,
+                        "z_now": z_now,
+                        "best_z": best_z_val,
+                        "z_entry": z_entry,
+                        "floor_hit": floor_hit,
+                        "pulled_back": pulled_back,
+                    })
+            elif USE_TP_HYSTERESIS:
                 prev_in_zone = bool(position.get("tp_in_zone", False))
                 if (not prev_in_zone) and abs(z_now) <= float(Z_TP_IN):
                     tp_zone = True
@@ -629,6 +711,14 @@ async def manage_trade_exits(node, indexer, wallet):
                 "z_entry": z_entry,
                 "age_hours": age_hours,
             })
+
+            # ── Post-SL cooldown: bloquea re-entrada tras Z_SL o HARD_SL ──
+            is_sl_exit = close_reason is not None and (
+                "Z_SL" in close_reason or "HARD_SL" in close_reason
+            )
+            if is_sl_exit:
+                half_life = _sf(position.get("half_life"), 0.0)
+                _write_sl_cooldown(m1, m2, half_life)
 
         except Exception as e:
             exit_error_count += 1

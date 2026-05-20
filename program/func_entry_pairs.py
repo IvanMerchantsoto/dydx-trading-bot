@@ -57,13 +57,42 @@ def _is_pair_in_fail_cooldown(m1, m2):
     rec = data.get(key)
     if not rec:
         return False
+
+    now_utc = datetime.now(timezone.utc)
+
+    # ── Check post-SL cooldown (set by func_exit_pairs._write_sl_cooldown) ──
+    sl_until_str = rec.get("sl_cooldown_until", "")
+    if sl_until_str:
+        try:
+            sl_until = datetime.fromisoformat(sl_until_str.replace("Z", "+00:00"))
+            if now_utc < sl_until:
+                remaining_h = (sl_until - now_utc).total_seconds() / 3600.0
+                log_event({
+                    "type": "signal_skip",
+                    "reason": "sl_cooldown",
+                    "pair": key,
+                    "remaining_hours": round(remaining_h, 2),
+                    "until": sl_until_str,
+                })
+                return True
+            else:
+                # Expired — clear it
+                rec.pop("sl_cooldown_until", None)
+                rec.pop("sl_cooldown_hours", None)
+                rec.pop("sl_ts", None)
+                data[key] = rec
+                _save_pair_fails(data)
+        except Exception:
+            pass
+
+    # ── Check execution-failure cooldown (consecutive fails) ──────────────
     count = rec.get("consecutive_fails", 0)
     if count < PAIR_FAIL_COOLDOWN_THRESHOLD:
         return False
     ts_str = rec.get("last_fail_ts", "")
     try:
         last_fail = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-        age_h = (datetime.now(timezone.utc) - last_fail).total_seconds() / 3600.0
+        age_h = (now_utc - last_fail).total_seconds() / 3600.0
         if age_h >= PAIR_FAIL_COOLDOWN_HOURS:
             # Cooldown expired — reset counter
             data[key] = {"consecutive_fails": 0, "last_fail_ts": ts_str}

@@ -1,0 +1,39 @@
+# Secrets — NUNCA subir
+.env
+*.env
+*.pem
+*.key
+
+# Estado del bot — específico por máquina/sesión
+program/bot_agents.json
+program/pair_fail_cooldowns.json
+program/bot_run.log.jsonl
+program/bot_out.log
+bot_stdout.log
+bot.pid
+
+# Datos generados — se regeneran solos
+program/cointegrated_pairs.csv
+program/market_prices.pkl
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# IDEs
+.idea/
+.vscode/
+*.iml
+.DS_Store
+
+# Backups
+backups/
+*.bak
+*.tmp

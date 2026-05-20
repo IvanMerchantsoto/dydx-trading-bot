@@ -712,6 +712,18 @@ async def manage_trade_exits(node, indexer, wallet):
                 "age_hours": age_hours,
             })
 
+            # ── Stdout exit log (visible en bot_stdout.log) ───────────────
+            emoji_exit = "✅" if net_pnl_est >= 0 else "🔴"
+            age_str_out = f"{age_hours:.2f}h" if age_hours is not None else "?"
+            z_str_out   = f"{z_now:.3f}" if z_now is not None else "?"
+            reason_short = (close_reason or "?")[:40]
+            print(
+                f"[EXIT] {emoji_exit} {m1}/{m2} | {reason_short} | "
+                f"gross=${pnl_gross:.2f} net=${net_pnl_est:.2f} fees=${open_fees_paid+close_fees_est:.2f} | "
+                f"z_entry={z_entry:.3f} z_now={z_str_out} | age={age_str_out}",
+                flush=True
+            )
+
             # ── Post-SL cooldown: bloquea re-entrada tras Z_SL o HARD_SL ──
             is_sl_exit = close_reason is not None and (
                 "Z_SL" in close_reason or "HARD_SL" in close_reason

@@ -31,6 +31,14 @@ PAIR_FAIL_COOLDOWN_THRESHOLD = 3    # fallos consecutivos antes de cooldown
 PAIR_FAIL_COOLDOWN_HOURS = 4.0      # horas de cooldown tras threshold
 PAIR_FAIL_RESET_ON_SUCCESS = True   # resetear contador si hay LIVE
 
+# ── Market concentration limit ────────────────────────────────────────────────
+# Máximo de pares abiertos que pueden compartir el mismo mercado.
+# Evita que ARKM-USD (presente en 9+ pares del CSV) bloquee todas las señales
+# en cuanto 1 par con ARKM está abierto.
+# Con MAX_TRADES_PER_MARKET=1: si ADA-USD ya está en un par activo, no se abre
+# otro par que use ADA-USD, aunque tenga z muy alto.
+MAX_TRADES_PER_MARKET = 1
+
 
 def _pair_key(m1, m2):
     return "/".join(sorted([str(m1), str(m2)]))
@@ -260,15 +268,20 @@ async def open_positions(
     candidates = []
 
     # Counters for scan diagnostics (printed at end of Phase 1)
-    _skip_invalid   = 0
-    _skip_live      = 0
-    _skip_cooldown  = 0
-    _skip_price_r   = 0
-    _skip_candles   = 0
-    _skip_low_z     = 0
-    _skip_min_size  = 0
-    _max_z_seen     = 0.0   # highest |z| seen (even if below threshold)
-    _best_low_z_pair = ""   # pair closest to threshold
+    _skip_invalid       = 0
+    _skip_live          = 0
+    _skip_concentration = 0
+    _skip_cooldown      = 0
+    _skip_price_r       = 0
+    _skip_candles       = 0
+    _skip_low_z         = 0
+    _skip_min_size      = 0
+    _max_z_seen         = 0.0   # highest |z| seen (even if below threshold)
+    _best_low_z_pair    = ""    # pair closest to threshold
+
+    # Track how many candidates per market in this scan cycle
+    # (prevents ARKM-USD appearing in 9 candidates when only 1 can be traded)
+    _market_candidate_count: dict = {}
 
     for _, row in df.iterrows():
         base_market = row["base_market"]
@@ -284,6 +297,17 @@ async def open_positions(
             continue
         if base_market in live_markets or quote_market in live_markets:
             _skip_live += 1
+            continue
+
+        # ── Market concentration limit ───────────────────────────────────
+        # Si un mercado ya aparece MAX_TRADES_PER_MARKET veces como candidato
+        # en este scan, saltamos pares adicionales con ese mercado.
+        # Evita que ARKM-USD (presente en 9+ pares del CSV) bloquee todo
+        # el capital cuando ya hay 1 candidato con ARKM.
+        b_count = _market_candidate_count.get(base_market, 0)
+        q_count = _market_candidate_count.get(quote_market, 0)
+        if b_count >= MAX_TRADES_PER_MARKET or q_count >= MAX_TRADES_PER_MARKET:
+            _skip_concentration += 1
             continue
         if _is_pair_in_fail_cooldown(base_market, quote_market):
             _skip_cooldown += 1
@@ -397,6 +421,10 @@ async def open_positions(
             "score": score,
         })
 
+        # Actualizar contadores de concentración por mercado
+        _market_candidate_count[base_market]  = _market_candidate_count.get(base_market, 0) + 1
+        _market_candidate_count[quote_market] = _market_candidate_count.get(quote_market, 0) + 1
+
     # ── Sort by score ──────────────────────────────────────────────────────
     if OPPORTUNITY_SCORING and candidates:
         candidates.sort(key=lambda c: c["score"], reverse=True)
@@ -405,8 +433,8 @@ async def open_positions(
     _total_csv = len(df)
     _phase1_summary = (
         f"[ENTRY] Phase1: {_total_csv} CSV pairs → "
-        f"invalid={_skip_invalid} live={_skip_live} cooldown={_skip_cooldown} "
-        f"price_ratio={_skip_price_r} candles={_skip_candles} "
+        f"invalid={_skip_invalid} live={_skip_live} concentration={_skip_concentration} "
+        f"cooldown={_skip_cooldown} price_ratio={_skip_price_r} candles={_skip_candles} "
         f"low_z={_skip_low_z}(max|z|={_max_z_seen:.2f} @ {_best_low_z_pair}) "
         f"min_size={_skip_min_size} → candidates={len(candidates)}"
     )

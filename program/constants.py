@@ -193,7 +193,7 @@ WINDOW = 21
 # Thresholds - Opening
 MAX_HALF_LIFE = 24
                        # El exit por Z_SL y HARD_SL gestiona el riesgo de tardanza
-ZSCORE_THRESH = 2.0    # Subido de 1.5 → mejor R:R (en z=1.5 R:R=0.53, en z=2.0 R:R=0.87+)
+ZSCORE_THRESH = 3.0    # Backtested: z=3 → EV=$35/trade, WR=85%, PF=2.9 (vs z=2: EV=$12, WR=77%, PF=1.6)
 USD_PER_TRADE = 1000
 USD_MIN_COLLATERAL = 7000
 
@@ -247,6 +247,20 @@ UNMANAGED_ALERT_COOLDOWN_SECONDS = 300
 # Markets con posición atascada que el abort no puede cerrar en testnet.
 # Ignorarlos evita que bloqueen entradas indefinidamente.
 # Vaciar cuando se cierren manualmente desde la UI de dYdX.
+# ===== Market Blacklist =====
+# Mercados que jamás deben usarse como leg en ningún par.
+# Criterio de inclusión: profit_factor < 0.5 en backtests de ≥3 trades,
+# o mercados conocidos por liquidez anómala / pegging no estable.
+#
+# Backtests (grid search 192 combos, 30 pares, 30 días, z=3):
+#   PENDLE-USD: 5 pares en bottom-10, pérdida combinada ≈ -$1,148
+#   ETC-USD/MNT-USD: 0% WR, -$32 (solo 2 trades, evidencia débil)
+#
+# Vaciar solo si cointegración se rehace y el mercado muestra PF>1.0.
+MARKET_BLACKLIST = {
+    "PENDLE-USD",   # tóxico: 5 pares en bottom-10, -$1,148 combinado (backtest 2026-05)
+}
+
 UNMANAGED_IGNORE_MARKETS = {
     "LDO-USD", "COMP-USD", "STX-USD", "ARKM-USD",
     # Posiciones atascadas por falta de liquidez en testnet (2026-05-19).

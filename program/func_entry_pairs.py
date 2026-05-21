@@ -5,6 +5,7 @@ from constants import (
     FUNDING_GATE_ENABLED, FUNDING_MAX_COST_RATIO,
     OPPORTUNITY_SCORING,
     MIN_EDGE_FEE_MULTIPLE,
+    MARKET_BLACKLIST,
 )
 from func_utils import format_number
 from func_public import get_candles_recent, get_market_spread_bps, get_funding_rates
@@ -268,6 +269,7 @@ async def open_positions(
     candidates = []
 
     # Counters for scan diagnostics (printed at end of Phase 1)
+    _skip_blacklist     = 0
     _skip_invalid       = 0
     _skip_live          = 0
     _skip_concentration = 0
@@ -290,6 +292,11 @@ async def open_positions(
         half_life = row.get("half_life")
 
         # ── Cheap filters (no API calls) ────────────────────────────────
+        if base_market in MARKET_BLACKLIST or quote_market in MARKET_BLACKLIST:
+            _skip_blacklist += 1
+            log_event({"type": "signal_skip", "reason": "market_blacklisted",
+                       "base": base_market, "quote": quote_market}, print_terminal=False)
+            continue
         if base_market not in markets or quote_market not in markets:
             _skip_invalid += 1
             log_event({"type": "signal_skip", "reason": "invalid_market",
@@ -433,7 +440,7 @@ async def open_positions(
     _total_csv = len(df)
     _phase1_summary = (
         f"[ENTRY] Phase1: {_total_csv} CSV pairs → "
-        f"invalid={_skip_invalid} live={_skip_live} concentration={_skip_concentration} "
+        f"blacklist={_skip_blacklist} invalid={_skip_invalid} live={_skip_live} concentration={_skip_concentration} "
         f"cooldown={_skip_cooldown} price_ratio={_skip_price_r} candles={_skip_candles} "
         f"low_z={_skip_low_z}(max|z|={_max_z_seen:.2f} @ {_best_low_z_pair}) "
         f"min_size={_skip_min_size} → candidates={len(candidates)}"

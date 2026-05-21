@@ -587,19 +587,23 @@ def load_pairs(csv_path: Path, top_n: Optional[int] = None,
                single_pair: Optional[str] = None) -> pd.DataFrame:
     df = pd.read_csv(csv_path)
 
-    # Normalizar nombres de columnas
+    # Normalizar nombres de columnas → siempre sym_1 / sym_2
     col_map = {}
     for c in df.columns:
         cl = c.strip().lower()
-        if cl in ("sym_1", "market_1", "ticker_1"):
+        if cl in ("sym_1", "market_1", "ticker_1", "base_market"):
             col_map[c] = "sym_1"
-        elif cl in ("sym_2", "market_2", "ticker_2"):
+        elif cl in ("sym_2", "market_2", "ticker_2", "quote_market"):
             col_map[c] = "sym_2"
         elif cl in ("hedge_ratio",):
             col_map[c] = "hedge_ratio"
         elif cl in ("half_life",):
             col_map[c] = "half_life"
     df = df.rename(columns=col_map)
+
+    # Eliminar filas con mercados vacíos o inválidos
+    df = df[df["sym_1"].notna() & df["sym_2"].notna()]
+    df = df[df["sym_1"].str.contains("-USD") & df["sym_2"].str.contains("-USD")]
 
     if single_pair:
         parts = single_pair.split("/")

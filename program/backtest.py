@@ -44,17 +44,35 @@ TAKER_FEE_BPS = 0.0005   # 0.05% per leg
 RT_FEE_MULT   = 2 * TAKER_FEE_BPS  # round-trip = open + close, both legs
 
 # ── Default simulation parameters (mirrors constants.py) ──────────────────────
-DEFAULT_PARAMS = {
-    "zscore_thresh":    2.0,
-    "z_tp":             0.7,
-    "z_sl_delta":       1.5,
-    "trail_tp":         True,
-    "trail_z_pullback": 0.3,
-    "trail_z_floor":    0.15,
-    "tp_confirm":       2,
-    "usd_per_trade":    500.0,
-    "z_score_window":   168,   # bars for rolling z-score (168h = 7 días)
-}
+try:
+    from constants import (
+        ZSCORE_THRESH, Z_TP, Z_SL_DELTA,
+        TRAIL_TP_ENABLED, TRAIL_Z_PULLBACK, TRAIL_Z_FLOOR,
+        TP_CONFIRM_CHECKS, USD_PER_TRADE,
+    )
+    DEFAULT_PARAMS = {
+        "zscore_thresh":    float(ZSCORE_THRESH),
+        "z_tp":             float(Z_TP),
+        "z_sl_delta":       float(Z_SL_DELTA),
+        "trail_tp":         bool(TRAIL_TP_ENABLED),
+        "trail_z_pullback": float(TRAIL_Z_PULLBACK),
+        "trail_z_floor":    float(TRAIL_Z_FLOOR),
+        "tp_confirm":       int(TP_CONFIRM_CHECKS),
+        "usd_per_trade":    float(USD_PER_TRADE),
+        "z_score_window":   168,
+    }
+except ImportError:
+    DEFAULT_PARAMS = {
+        "zscore_thresh":    2.0,
+        "z_tp":             0.7,
+        "z_sl_delta":       1.5,
+        "trail_tp":         False,
+        "trail_z_pullback": 0.3,
+        "trail_z_floor":    0.15,
+        "tp_confirm":       2,
+        "usd_per_trade":    500.0,
+        "z_score_window":   168,
+    }
 
 # ── Grid search space ─────────────────────────────────────────────────────────
 GRID = {

@@ -208,7 +208,7 @@ CLOSE_AT_ZSCORE_CROSS = True
 # Ejemplo: entramos a z=2.0. Z baja a 0.3 (best_z=0.3), luego rebota a 0.6:
 #   → cerramos en 0.6 en lugar de 0.7 → capturamos 1.4 unidades en vez de 1.3
 # Ejemplo: Z baja a 0.1 (floor_hit=True) → cerramos inmediatamente sin esperar rebote.
-TRAIL_TP_ENABLED = True
+TRAIL_TP_ENABLED = False  # Backtest: fixed TP z≤0.7 es significativamente mejor (+$280 diferencia en 5 pares)
 TRAIL_Z_PULLBACK = 0.3   # cerrar cuando |z| rebota 0.3 desde el mejor z visto
 TRAIL_Z_FLOOR = 0.15     # si |z| llega aquí, cerrar inmediatamente (no esperar rebote)
 

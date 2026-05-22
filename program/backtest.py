@@ -49,7 +49,14 @@ try:
         ZSCORE_THRESH, Z_TP, Z_SL_DELTA,
         TRAIL_TP_ENABLED, TRAIL_Z_PULLBACK, TRAIL_Z_FLOOR,
         TP_CONFIRM_CHECKS, USD_PER_TRADE,
+        WINDOW as LIVE_WINDOW,   # z-score rolling window used by the live bot
     )
+    # IMPORTANTE: z_score_window se lee de constants.WINDOW para que el backtest
+    # simule exactamente la misma ventana de z-score que usa el live bot.
+    # Antes estaba hardcodeado en 168 — esto creaba una discrepancia grande:
+    #   Live bot:  WINDOW=21  (21 horas de datos)
+    #   Backtest:  168 bars   (7 días de datos)
+    # Los resultados del grid search NO eran representativos del comportamiento real.
     DEFAULT_PARAMS = {
         "zscore_thresh":    float(ZSCORE_THRESH),
         "z_tp":             float(Z_TP),
@@ -59,9 +66,11 @@ try:
         "trail_z_floor":    float(TRAIL_Z_FLOOR),
         "tp_confirm":       int(TP_CONFIRM_CHECKS),
         "usd_per_trade":    float(USD_PER_TRADE),
-        "z_score_window":   168,
+        "z_score_window":   int(LIVE_WINDOW),   # ← sincronizado con constants.WINDOW
     }
+    print(f"[BACKTEST] z_score_window={int(LIVE_WINDOW)} (from constants.WINDOW)")
 except ImportError:
+    LIVE_WINDOW = 21
     DEFAULT_PARAMS = {
         "zscore_thresh":    2.0,
         "z_tp":             0.7,
@@ -71,8 +80,9 @@ except ImportError:
         "trail_z_floor":    0.15,
         "tp_confirm":       2,
         "usd_per_trade":    500.0,
-        "z_score_window":   168,
+        "z_score_window":   21,   # fallback: same as live default
     }
+    print("[BACKTEST] constants.py not found — using default z_score_window=21")
 
 # ── Grid search space ─────────────────────────────────────────────────────────
 GRID = {
@@ -221,6 +231,7 @@ def simulate_pair(prices_m1: list, prices_m2: list, hedge_ratio: float,
     entry_side = "short"  # "short" = short m1 / long m2
     best_z     = 99.0
     tp_confirm_count = 0
+    mae_running = 0.0   # Maximum Adverse Excursion (peor pnl_gross durante el trade)
 
     for i in range(window, n):
         w_spread = spread[i - window:i]
@@ -241,6 +252,7 @@ def simulate_pair(prices_m1: list, prices_m2: list, hedge_ratio: float,
                 tp_confirm_count = 0
                 entry_side       = "short" if z > 0 else "long"
                 open_fee         = USD * 2 * TAKER_FEE_BPS
+                mae_running      = 0.0   # reset MAE tracker on new trade
 
         elif state == "in_trade":
             best_z = min(best_z, abs(z))
@@ -259,6 +271,11 @@ def simulate_pair(prices_m1: list, prices_m2: list, hedge_ratio: float,
             close_fee  = USD * 2 * TAKER_FEE_BPS
             total_fees = open_fee + close_fee
             net_pnl    = pnl_gross - total_fees
+
+            # Actualizar MAE (Maximum Adverse Excursion)
+            # MAE = el peor pnl_gross visto mientras el trade estaba abierto
+            if pnl_gross < mae_running:
+                mae_running = pnl_gross
 
             close_reason = None
 
@@ -298,11 +315,13 @@ def simulate_pair(prices_m1: list, prices_m2: list, hedge_ratio: float,
                     "pnl_gross":  round(pnl_gross, 4),
                     "fees":       round(total_fees, 4),
                     "net_pnl":    round(net_pnl, 4),
+                    "mae":        round(mae_running, 4),   # worst pnl_gross seen during trade
                     "close_reason": close_reason,
                     "entry_side": entry_side,
                 })
                 state            = "flat"
                 tp_confirm_count = 0
+                mae_running      = 0.0
 
     return trades
 
@@ -318,6 +337,8 @@ def compute_metrics(all_trades: list, label: str = "") -> dict:
             "avg_win": 0, "avg_loss": 0, "net_pnl": 0, "total_fees": 0,
             "max_drawdown": 0, "sharpe": 0, "ev_per_trade": 0,
             "tp_pct": 0, "sl_pct": 0, "time_pct": 0,
+            "avg_hold_bars": 0, "mae_avg": 0, "mae_p95": 0,
+            "fee_drag_pct": 0,
         }
 
     df = pd.DataFrame(all_trades)
@@ -351,21 +372,42 @@ def compute_metrics(all_trades: list, label: str = "") -> dict:
     # Distribución de motivos de cierre
     reason_pct = df["close_reason"].value_counts(normalize=True).to_dict()
 
+    # ── Hold time ──────────────────────────────────────────────────────────
+    avg_hold = df["hold_bars"].mean() if "hold_bars" in df.columns else 0.0
+
+    # ── MAE (Maximum Adverse Excursion) ────────────────────────────────────
+    # MAE = peor pnl_gross visto mientras el trade estaba abierto.
+    # Si MAE ≈ 0 → los trades nunca van en contra antes de cerrar (señal limpia).
+    # Si MAE >> avg_loss → el SL está muy lejos; hay margen para apretarlo.
+    # Si MAE_p95 > HARD_SL → hay trades que atraviesan el SL sin cerrar (slippage?).
+    mae_col = df["mae"] if "mae" in df.columns else pd.Series([0.0] * n)
+    mae_avg = mae_col.mean()
+    mae_p95 = np.percentile(mae_col, 5)   # p5 del MAE (los más negativos = peor excursión)
+
+    # ── Fee drag ─────────────────────────────────────────────────────────
+    # ¿Qué % del gross PnL se pierde en fees? Si > 80% → la estrategia es fee-intensive.
+    gross_pnl_total = df["pnl_gross"].sum() if "pnl_gross" in df.columns else net_pnl + total_fees
+    fee_drag_pct = (total_fees / max(abs(gross_pnl_total), 1e-9)) * 100 if gross_pnl_total > 0 else 0.0
+
     return {
-        "label":         label,
-        "n_trades":      n,
-        "win_rate":      round(win_rate * 100, 1),
-        "profit_factor": round(pf, 3),
-        "avg_win":       round(avg_win, 3),
-        "avg_loss":      round(avg_loss, 3),
-        "net_pnl":       round(net_pnl, 2),
-        "total_fees":    round(total_fees, 2),
-        "max_drawdown":  round(max_dd, 2),
-        "sharpe":        round(sharpe, 3),
-        "ev_per_trade":  round(ev, 3),
-        "tp_pct":        round(reason_pct.get("TP", 0) * 100, 1),
-        "sl_pct":        round(reason_pct.get("Z_SL", 0) * 100, 1),
-        "time_pct":      round(reason_pct.get("TIME_STOP", 0) * 100, 1),
+        "label":          label,
+        "n_trades":       n,
+        "win_rate":       round(win_rate * 100, 1),
+        "profit_factor":  round(pf, 3),
+        "avg_win":        round(avg_win, 3),
+        "avg_loss":       round(avg_loss, 3),
+        "net_pnl":        round(net_pnl, 2),
+        "total_fees":     round(total_fees, 2),
+        "max_drawdown":   round(max_dd, 2),
+        "sharpe":         round(sharpe, 3),
+        "ev_per_trade":   round(ev, 3),
+        "tp_pct":         round(reason_pct.get("TP", 0) * 100, 1),
+        "sl_pct":         round(reason_pct.get("Z_SL", 0) * 100, 1),
+        "time_pct":       round(reason_pct.get("TIME_STOP", 0) * 100, 1),
+        "avg_hold_bars":  round(avg_hold, 1),
+        "mae_avg":        round(mae_avg, 3),
+        "mae_p95":        round(mae_p95, 3),   # 5th percentile (worst excursions)
+        "fee_drag_pct":   round(fee_drag_pct, 1),
     }
 
 
@@ -374,16 +416,30 @@ def compute_metrics(all_trades: list, label: str = "") -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_backtest(pairs_df: pd.DataFrame, params: dict,
-                 n_bars: int = 720, verbose: bool = True) -> dict:
+                 n_bars: int = 720, verbose: bool = True,
+                 test_split: float = 0.0) -> dict:
     """
     Corre la simulación para todos los pares en pairs_df.
+
+    test_split : float in [0.0, 0.9]
+        Si > 0, divide los datos en dos períodos:
+          - IN-SAMPLE  : primeros (1-test_split) * n_bars
+          - OUT-OF-SAMPLE : últimos test_split * n_bars
+        Se reportan métricas separadas para cada período.
+        Ejemplo: test_split=0.3 → 70% train (504 bars) / 30% test (216 bars)
+        Esto permite validar que el hedge_ratio sigue siendo válido en datos futuros.
+
     Retorna dict con métricas agregadas y lista de todos los trades.
     """
-    all_trades = []
-    pair_results = []
+    all_trades    = []
+    is_trades     = []   # in-sample
+    oos_trades    = []   # out-of-sample
+    pair_results  = []
     n_pairs    = len(pairs_df)
     fetched    = 0
     skipped    = 0
+
+    do_split   = 0.0 < test_split < 1.0
 
     markets_cache = {}  # evitar re-descargar el mismo mercado
 
@@ -414,12 +470,42 @@ def run_backtest(pairs_df: pd.DataFrame, params: dict,
             skipped += 1
             continue
 
-        trades = simulate_pair(p1, p2, hr, params)
         fetched += 1
 
-        if verbose:
-            net = sum(t["net_pnl"] for t in trades)
-            print(f"{len(trades)} trades | net=${net:.2f}")
+        if do_split:
+            n = min(len(p1), len(p2))
+            split_idx = int(n * (1.0 - test_split))
+            # Necesitamos warmup (window bars) en cada split
+            window = int(params.get("z_score_window", 168))
+
+            # IN-SAMPLE: primeros split_idx bars
+            p1_is = p1[:split_idx]
+            p2_is = p2[:split_idx]
+            trades_is = simulate_pair(p1_is, p2_is, hr, params) if len(p1_is) > window + 10 else []
+
+            # OUT-OF-SAMPLE: últimos (n - split_idx) bars (conservamos warmup al inicio)
+            # Tomamos max(split_idx - window, 0) para incluir el warmup del OOS
+            oos_start = max(split_idx - window, 0)
+            p1_oos = p1[oos_start:]
+            p2_oos = p2[oos_start:]
+            trades_oos = simulate_pair(p1_oos, p2_oos, hr, params) if len(p1_oos) > window + 10 else []
+            # Excluir trades que cayeron en la ventana de warmup del OOS
+            # (entry_idx >= window garantiza que están en la zona OOS real)
+            trades_oos_real = [t for t in trades_oos]  # simulate_pair ya empieza en bar[window]
+
+            is_trades.extend(trades_is)
+            oos_trades.extend(trades_oos_real)
+            trades = trades_is + trades_oos_real
+
+            if verbose:
+                net_is  = sum(t["net_pnl"] for t in trades_is)
+                net_oos = sum(t["net_pnl"] for t in trades_oos_real)
+                print(f"IS: {len(trades_is)} trades ${net_is:.2f} | OOS: {len(trades_oos_real)} trades ${net_oos:.2f}")
+        else:
+            trades = simulate_pair(p1, p2, hr, params)
+            if verbose:
+                net = sum(t["net_pnl"] for t in trades)
+                print(f"{len(trades)} trades | net=${net:.2f}")
 
         all_trades.extend(trades)
         if trades:
@@ -431,12 +517,20 @@ def run_backtest(pairs_df: pd.DataFrame, params: dict,
     metrics["pairs_run"]     = fetched
     metrics["pairs_skipped"] = skipped
 
-    return {
+    result = {
         "metrics":      metrics,
         "all_trades":   all_trades,
         "pair_results": pair_results,
         "params":       params,
     }
+
+    # Añadir métricas de split si corresponde
+    if do_split:
+        result["is_metrics"]  = compute_metrics(is_trades,  label="IN-SAMPLE")
+        result["oos_metrics"] = compute_metrics(oos_trades, label="OUT-OF-SAMPLE")
+        result["test_split"]  = test_split
+
+    return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -517,24 +611,31 @@ def run_grid_search(pairs_df: pd.DataFrame, n_bars: int = 720) -> pd.DataFrame:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def print_metrics(m: dict, title: str = ""):
-    w = 52
+    w = 58
     print(f"\n{'─'*w}")
     if title:
         print(f"  {title}")
     print(f"{'─'*w}")
-    print(f"  Trades:         {m['n_trades']}")
-    print(f"  Win rate:       {m['win_rate']}%")
-    print(f"  Profit factor:  {m['profit_factor']}")
-    print(f"  EV / trade:     ${m['ev_per_trade']}")
-    print(f"  Avg win:        ${m['avg_win']}")
-    print(f"  Avg loss:       ${m['avg_loss']}")
-    print(f"  Net PnL:        ${m['net_pnl']}")
-    print(f"  Total fees:     ${m['total_fees']}")
-    print(f"  Max drawdown:   ${m['max_drawdown']}")
-    print(f"  Sharpe:         {m['sharpe']}")
-    print(f"  TP exits:       {m['tp_pct']}%")
-    print(f"  SL exits:       {m['sl_pct']}%")
-    print(f"  Time stops:     {m['time_pct']}%")
+    print(f"  Trades:          {m['n_trades']}")
+    print(f"  Win rate:        {m['win_rate']}%")
+    print(f"  Profit factor:   {m['profit_factor']}")
+    print(f"  EV / trade:      ${m['ev_per_trade']}")
+    print(f"  Avg win:         ${m['avg_win']}")
+    print(f"  Avg loss:        ${m['avg_loss']}")
+    print(f"  Net PnL:         ${m['net_pnl']}")
+    print(f"  Total fees:      ${m['total_fees']}  (fee drag: {m.get('fee_drag_pct', 0):.1f}% of gross)")
+    print(f"  Max drawdown:    ${m['max_drawdown']}")
+    print(f"  Sharpe:          {m['sharpe']}")
+    print(f"  TP exits:        {m['tp_pct']}%")
+    print(f"  SL exits:        {m['sl_pct']}%")
+    print(f"  Time stops:      {m['time_pct']}%")
+    # ── nuevas métricas ──
+    print(f"  Avg hold:        {m.get('avg_hold_bars', 0):.1f} bars")
+    mae_avg = m.get('mae_avg', 0)
+    mae_p95 = m.get('mae_p95', 0)
+    print(f"  MAE avg:         ${mae_avg:.3f}  (5th pctl worst: ${mae_p95:.3f})")
+    if mae_avg < -5.0:
+        print(f"  ⚠️  MAE promedio negativo alto — trades van muy en contra antes de cerrar")
     print(f"{'─'*w}")
 
 
@@ -639,14 +740,67 @@ def load_pairs(csv_path: Path, top_n: Optional[int] = None,
     return df.reset_index(drop=True)
 
 
+def print_split_comparison(result: dict):
+    """Imprime comparación IS vs OOS cuando test_split > 0."""
+    is_m  = result.get("is_metrics", {})
+    oos_m = result.get("oos_metrics", {})
+    split = result.get("test_split", 0)
+    if not is_m or not oos_m:
+        return
+    w = 62
+    print(f"\n{'═'*w}")
+    print(f"  TRAIN/TEST SPLIT  (IS={100*(1-split):.0f}% / OOS={100*split:.0f}%)")
+    print(f"{'═'*w}")
+    print(f"  {'Métrica':<22}  {'IN-SAMPLE':>12}  {'OUT-OF-SAMPLE':>14}")
+    print(f"  {'─'*22}  {'─'*12}  {'─'*14}")
+    for k, label in [
+        ("n_trades",      "Trades"),
+        ("win_rate",      "Win rate"),
+        ("profit_factor", "Profit factor"),
+        ("ev_per_trade",  "EV / trade"),
+        ("net_pnl",       "Net PnL"),
+        ("max_drawdown",  "Max drawdown"),
+        ("sharpe",        "Sharpe"),
+    ]:
+        iv = is_m.get(k, 0)
+        ov = oos_m.get(k, 0)
+        if k in ("win_rate",):
+            print(f"  {label:<22}  {str(iv)+'%':>12}  {str(ov)+'%':>14}")
+        elif k in ("net_pnl", "max_drawdown", "ev_per_trade"):
+            print(f"  {label:<22}  {'${:.2f}'.format(iv):>12}  {'${:.2f}'.format(ov):>14}")
+        else:
+            print(f"  {label:<22}  {str(iv):>12}  {str(ov):>14}")
+
+    # Indicador de overfitting
+    if is_m.get("n_trades", 0) > 0 and oos_m.get("n_trades", 0) > 0:
+        is_ev  = is_m.get("ev_per_trade", 0)
+        oos_ev = oos_m.get("ev_per_trade", 0)
+        if is_ev > 0:
+            decay = (is_ev - oos_ev) / abs(is_ev) * 100
+            flag = "⚠️  POSIBLE OVERFIT" if decay > 40 else "✅ Generaliza bien"
+            print(f"\n  EV decay IS→OOS: {decay:+.1f}%  {flag}")
+    print(f"{'═'*w}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="dYdX stat-arb backtester")
-    parser.add_argument("--grid",    action="store_true",  help="Correr grid search")
-    parser.add_argument("--top",     type=int, default=None, help="Usar solo los N primeros pares del CSV")
-    parser.add_argument("--pair",    type=str, default=None, help='Par específico: "ADA-USD/MNT-USD"')
-    parser.add_argument("--bars",    type=int, default=720,  help="Número de barras históricas a descargar (default: 720 = 30 días)")
-    parser.add_argument("--no-cache", action="store_true",  help="Ignorar caché y re-descargar todo")
+    parser.add_argument("--grid",       action="store_true",  help="Correr grid search")
+    parser.add_argument("--top",        type=int, default=None, help="Usar solo los N primeros pares del CSV")
+    parser.add_argument("--pair",       type=str, default=None, help='Par específico: "ADA-USD/MNT-USD"')
+    parser.add_argument("--bars",       type=int, default=720,  help="Número de barras históricas a descargar (default: 720 = 30 días)")
+    parser.add_argument("--no-cache",   action="store_true",  help="Ignorar caché y re-descargar todo")
+    parser.add_argument("--test-split", type=float, default=0.0,
+                        help="Fracción de datos para OOS (0.0=off, 0.3=70IS/30OOS). "
+                             "Recomendado: --bars 1440 --test-split 0.3 para 30 días OOS")
+    parser.add_argument("--window",     type=int, default=None,
+                        help=f"Override z-score window (default: constants.WINDOW={int(LIVE_WINDOW)}). "
+                             "Útil para comparar: --window 21 vs --window 168")
     args = parser.parse_args()
+
+    # Override z_score_window if --window is passed
+    if args.window is not None:
+        DEFAULT_PARAMS["z_score_window"] = args.window
+        print(f"[BACKTEST] z_score_window overridden via --window: {args.window}")
 
     if not CSV_PATH.exists():
         print(f"ERROR: No se encontró {CSV_PATH}")
@@ -658,11 +812,21 @@ def main():
         print("No se encontraron pares. Verifica --pair o --top.")
         sys.exit(1)
 
-    print(f"\n{'='*60}")
-    print(f"  dYdX STAT-ARB BACKTESTER")
-    print(f"  {len(pairs_df)} pares | {args.bars} barras por mercado")
-    print(f"  Caché: {'desactivada' if args.no_cache else 'activa (~{:.0f}h)'.format(6)}")
-    print(f"{'='*60}")
+    test_split = float(args.test_split)
+    if test_split > 0:
+        print(f"\n{'='*60}")
+        print(f"  dYdX STAT-ARB BACKTESTER  [TRAIN/TEST MODE]")
+        print(f"  {len(pairs_df)} pares | {args.bars} barras | "
+              f"IS={100*(1-test_split):.0f}% / OOS={100*test_split:.0f}%")
+        print(f"  OOS = últimos ~{int(args.bars*test_split)} barras "
+              f"({int(args.bars*test_split/24)} días)")
+        print(f"{'='*60}")
+    else:
+        print(f"\n{'='*60}")
+        print(f"  dYdX STAT-ARB BACKTESTER")
+        print(f"  {len(pairs_df)} pares | {args.bars} barras por mercado")
+        print(f"  Caché: {'desactivada' if args.no_cache else 'activa (~{:.0f}h)'.format(6)}")
+        print(f"{'='*60}")
 
     if args.grid:
         grid_df = run_grid_search(pairs_df, n_bars=args.bars)
@@ -676,8 +840,11 @@ def main():
                 best_params[k] = best[k]
 
         print(f"\nBacktest detallado con mejores parámetros...")
-        result = run_backtest(pairs_df, best_params, n_bars=args.bars, verbose=False)
+        result = run_backtest(pairs_df, best_params, n_bars=args.bars, verbose=False,
+                              test_split=test_split)
         print_metrics(result["metrics"], title="RESULTADO CON MEJORES PARÁMETROS")
+        if test_split > 0:
+            print_split_comparison(result)
         print_pair_breakdown(result["pair_results"])
 
         # Guardar resultados
@@ -694,9 +861,12 @@ def main():
                 print(f"  {k} = {v}")
         print()
 
-        result = run_backtest(pairs_df, params, n_bars=args.bars, verbose=True)
+        result = run_backtest(pairs_df, params, n_bars=args.bars, verbose=True,
+                              test_split=test_split)
 
         print_metrics(result["metrics"], title="RESULTADO GLOBAL")
+        if test_split > 0:
+            print_split_comparison(result)
         print_pair_breakdown(result["pair_results"])
 
         # Guardar trades individuales

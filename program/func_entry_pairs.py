@@ -6,6 +6,7 @@ from constants import (
     OPPORTUNITY_SCORING,
     MIN_EDGE_FEE_MULTIPLE,
     MARKET_BLACKLIST,
+    HEDGE_RATIO_LOG_MAX,
 )
 from func_utils import format_number
 from func_public import get_candles_recent, get_market_spread_bps, get_funding_rates
@@ -20,6 +21,7 @@ import json
 import os
 import math
 import uuid
+import numpy as np
 
 JSON_PATH = os.path.join(os.path.dirname(__file__), "bot_agents.json")
 
@@ -274,6 +276,7 @@ async def open_positions(
     _skip_live          = 0
     _skip_concentration = 0
     _skip_cooldown      = 0
+    _skip_hedge_ratio   = 0  # hedge ratio outside valid log10 range
     _skip_price_r       = 0
     _skip_candles       = 0
     _skip_low_z         = 0
@@ -297,6 +300,17 @@ async def open_positions(
             log_event({"type": "signal_skip", "reason": "market_blacklisted",
                        "base": base_market, "quote": quote_market}, print_terminal=False)
             continue
+
+        # ── Hedge ratio sanity check (belt-and-suspenders if CSV is stale) ──
+        # Ratios extremos como BTC/SHIB (12.8B) no tienen sentido económico:
+        # el sizing de la leg barata sería microscópico y el z-score espurio.
+        if hedge_ratio <= 0 or abs(np.log10(abs(hedge_ratio))) > HEDGE_RATIO_LOG_MAX:
+            _skip_hedge_ratio += 1
+            log_event({"type": "signal_skip", "reason": "hedge_ratio_extreme",
+                       "base": base_market, "quote": quote_market,
+                       "hedge_ratio": hedge_ratio}, print_terminal=False)
+            continue
+
         if base_market not in markets or quote_market not in markets:
             _skip_invalid += 1
             log_event({"type": "signal_skip", "reason": "invalid_market",
@@ -337,6 +351,11 @@ async def open_positions(
         price_ratio = max(base_price, quote_price) / max(1e-12, min(base_price, quote_price))
         if price_ratio > MAX_PRICE_RATIO:
             _skip_price_r += 1
+            log_event({"type": "signal_skip", "reason": "price_ratio",
+                       "base": base_market, "quote": quote_market,
+                       "price_ratio": round(price_ratio, 1),
+                       "base_price": base_price, "quote_price": quote_price},
+                      print_terminal=False)
             continue
 
         # ── Candle fetch + z-score (main API cost per candidate) ─────────
@@ -362,6 +381,30 @@ async def open_positions(
         if abs(z_score) < ZSCORE_THRESH:
             _skip_low_z += 1
             continue
+
+        # ── Spread quality diagnostics ───────────────────────────────────
+        spread_std = float(np.std(spread[-WINDOW:]) if len(spread) >= WINDOW else np.std(spread))
+        spread_mean = float(np.mean(spread[-WINDOW:]) if len(spread) >= WINDOW else np.mean(spread))
+
+        # ── Hedge ratio drift check (CSV vs live OLS) ────────────────────
+        # Detecta si el hedge ratio del CSV sigue siendo válido hoy.
+        # Un drift >30% indica que la relación de precios cambió — el z-score
+        # puede estar mal escalado y la posición puede no ser market-neutral.
+        try:
+            _hr_live = float(np.polyfit(series_2.values, series_1.values, 1)[0])
+            _hr_drift_pct = abs(_hr_live - hedge_ratio) / max(abs(hedge_ratio), 1e-10) * 100.0
+            if _hr_drift_pct > 30.0:
+                log_event({
+                    "type": "hedge_ratio_drift_warning",
+                    "base": base_market,
+                    "quote": quote_market,
+                    "hr_csv": round(hedge_ratio, 6),
+                    "hr_live": round(_hr_live, 6),
+                    "drift_pct": round(_hr_drift_pct, 2),
+                    "z_score": round(z_score, 3),
+                })
+        except Exception:
+            pass
 
         spread_s = pd.Series(spread)
         if len(spread_s) < WINDOW + 1:
@@ -426,6 +469,8 @@ async def open_positions(
             "accept_failsafe_base_price": accept_failsafe_base_price,
             "spread_bps": spread_bps,
             "score": score,
+            "spread_std": spread_std,
+            "spread_mean": spread_mean,
         })
 
         # Actualizar contadores de concentración por mercado
@@ -440,7 +485,8 @@ async def open_positions(
     _total_csv = len(df)
     _phase1_summary = (
         f"[ENTRY] Phase1: {_total_csv} CSV pairs → "
-        f"blacklist={_skip_blacklist} invalid={_skip_invalid} live={_skip_live} concentration={_skip_concentration} "
+        f"blacklist={_skip_blacklist} hedge={_skip_hedge_ratio} invalid={_skip_invalid} "
+        f"live={_skip_live} concentration={_skip_concentration} "
         f"cooldown={_skip_cooldown} price_ratio={_skip_price_r} candles={_skip_candles} "
         f"low_z={_skip_low_z}(max|z|={_max_z_seen:.2f} @ {_best_low_z_pair}) "
         f"min_size={_skip_min_size} → candidates={len(candidates)}"
@@ -451,8 +497,11 @@ async def open_positions(
         "type": "entry_candidates_scored",
         "total_csv": _total_csv,
         "total_candidates": len(candidates),
+        "skip_blacklist": _skip_blacklist,
+        "skip_hedge_ratio": _skip_hedge_ratio,
         "skip_invalid": _skip_invalid,
         "skip_live": _skip_live,
+        "skip_price_ratio": _skip_price_r,
         "skip_cooldown": _skip_cooldown,
         "skip_low_z": _skip_low_z,
         "skip_min_size": _skip_min_size,
@@ -561,10 +610,12 @@ async def open_positions(
             "trace_id": trace_id,
             "base": base_market,
             "quote": quote_market,
-            "z": z_score,
+            "z": round(z_score, 4),
             "score": round(cand["score"], 4),
             "spread_bps": round(cand["spread_bps"], 1),
             "spread_dev": round(cand["spread_dev"], 6),
+            "spread_std_window": round(cand.get("spread_std", float("nan")), 6),
+            "spread_mean_window": round(cand.get("spread_mean", float("nan")), 6),
             "approx_spread_usd": round(approx_spread_usd, 4),
             "min_edge_required": round(min_edge_required, 4),
             "base_side": base_side,

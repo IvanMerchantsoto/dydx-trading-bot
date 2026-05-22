@@ -247,6 +247,32 @@ UNMANAGED_ALERT_COOLDOWN_SECONDS = 300
 # Markets con posición atascada que el abort no puede cerrar en testnet.
 # Ignorarlos evita que bloqueen entradas indefinidamente.
 # Vaciar cuando se cierren manualmente desde la UI de dYdX.
+
+# ===== Pair Quality Filters =====
+# Aplicados durante la generación del CSV (func_cointegration.py) Y en el scan
+# de entrada (func_entry_pairs.py) como segunda línea de defensa.
+#
+# HEDGE RATIO: pares con ratio fuera del rango [10^-LOG_MAX, 10^LOG_MAX]
+# son casi siempre espurios — el tamaño de posición resultante es microscópico
+# o astronómico, y el z-score no tiene significado económico real.
+# Log10 = 3.5 → rango válido: [0.000316, 3162]
+# Ejemplos filtrados: BTC/SHIB (hedge=12.8B), ETH/BLUR (88K), BTC/POL (822K)
+# Ejemplos permitidos: WIF/ENA (1.81), AVAX/ENS (1.44), LINK/MANA (107)
+HEDGE_RATIO_LOG_MAX = 3.5    # máximo log10 del |hedge ratio|
+
+# HURST EXPONENT: filtra spreads que NO son mean-reverting.
+# IMPORTANTE: se aplica a las DIFERENCIAS del spread (diff = spread[t] - spread[t-1]).
+# Sobre las diferencias, un spread mean-reverting tiene autocorrelación negativa → H < 0.5.
+# Un random walk tiene diferencias i.i.d. → H ≈ 0.5-0.58.
+#
+# Calibración empírica sobre spreads AR(1) sintéticos a 1H:
+#   half_life=4h  → H_diff=0.265   <- PASA (claramente mean-reverting)
+#   half_life=24h → H_diff=0.488   <- PASA (barely, al límite)
+#   Random walk   → H_diff=0.579   <- RECHAZADO
+# Threshold 0.52 acepta todos los spreads cointegrados con HL <= MAX_HALF_LIFE=24h.
+HURST_MAX = 0.52             # rechazar spread si H_diff >= este valor (sobre diferencias)
+HURST_MIN_BARS = 40          # mínimo de barras para calcular Hurst confiablemente
+
 # ===== Market Blacklist =====
 # Mercados que jamás deben usarse como leg en ningún par.
 # Criterio de inclusión: profit_factor < 0.5 en backtests de ≥3 trades,

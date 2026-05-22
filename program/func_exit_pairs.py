@@ -26,6 +26,7 @@ from v4_proto.dydxprotocol.clob.order_pb2 import Order
 import json
 import asyncio
 import os
+import numpy as np
 from datetime import datetime, timezone
 
 JSON_PATH = os.path.join(os.path.dirname(__file__), "bot_agents.json")
@@ -387,20 +388,77 @@ async def manage_trade_exits(node, indexer, wallet):
 
         # Current z-score
         z_now = None
+        _z_skip_reason = None
         try:
             series_1 = await get_candles_recent(indexer, m1)
             series_2 = await get_candles_recent(indexer, m2)
 
-            n = min(len(series_1), len(series_2))
-            if n > 25:
+            n1, n2 = len(series_1), len(series_2)
+            n = min(n1, n2)
+
+            if n1 == 0 or n2 == 0:
+                _z_skip_reason = f"empty_candles m1={n1} m2={n2}"
+            elif n <= 25:
+                _z_skip_reason = f"too_few_bars n={n} (need >25)"
+            else:
                 series_1 = series_1[-n:]
                 series_2 = series_2[-n:]
                 h = _sf(position.get("hedge_ratio"), 1.0)
-                spread = series_1 - (h * series_2)
-                z_now = float(calculate_zscore(spread).values.tolist()[-1])
-        except Exception:
+                if h == 0:
+                    _z_skip_reason = "hedge_ratio_zero"
+                else:
+                    spread = series_1 - (h * series_2)
+                    spread_std = float(np.nanstd(spread))
+                    zscore_series = calculate_zscore(spread)
+                    z_last = zscore_series.values.tolist()[-1]
+
+                    if spread_std < 1e-8:
+                        _z_skip_reason = f"spread_std_near_zero={spread_std:.2e}"
+                    elif z_last is None or (isinstance(z_last, float) and np.isnan(z_last)):
+                        _z_skip_reason = "zscore_nan (window not yet filled)"
+                    elif abs(z_last) > 10.0:
+                        # Extreme z likely indicates a data/price spike — log but still use
+                        log_event({
+                            "type": "zscore_extreme_warning",
+                            "trace_id": trace_id,
+                            "m1": m1, "m2": m2,
+                            "z_last": round(float(z_last), 3),
+                            "spread_std": round(spread_std, 6),
+                            "n_bars": n,
+                        })
+                        z_now = float(z_last)
+                    else:
+                        z_now = float(z_last)
+
+                    # ── Spread quality diagnostics ─────────────────────────
+                    # Log spread stats periodically for drift detection.
+                    # Only when z_now is valid (not on error paths).
+                    if z_now is not None:
+                        spread_mean = float(np.nanmean(spread))
+                        log_event({
+                            "type": "zscore_live",
+                            "trace_id": trace_id,
+                            "m1": m1, "m2": m2,
+                            "z_now": round(z_now, 4),
+                            "z_entry": round(z_entry, 4),
+                            "spread_mean": round(spread_mean, 6),
+                            "spread_std": round(spread_std, 6),
+                            "n_bars": n,
+                            "hedge_ratio": round(h, 6),
+                        }, print_terminal=False)
+
+        except Exception as _ze:
             z_now = None
+            _z_skip_reason = f"exception: {_ze}"
             zcalc_error_count += 1
+
+        if _z_skip_reason:
+            log_event({
+                "type": "zscore_unavailable",
+                "trace_id": trace_id,
+                "m1": m1, "m2": m2,
+                "reason": _z_skip_reason,
+            }, print_terminal=False)
 
         # ── Update best_z (lowest |z| seen since entry) ──────────────────
         # Tracked continuously so trailing TP has the full picture.
@@ -669,6 +727,80 @@ async def manage_trade_exits(node, indexer, wallet):
                     True,
                     time_in_force_type=Order.TimeInForce.TIME_IN_FORCE_IOC
                 )
+
+            # ── Post-close verification ──────────────────────────────────
+            # Esperar 2s y verificar que ambas legs quedaron flat en el exchange.
+            # Si alguna leg sigue abierta → loguear y reintentar el cierre.
+            # Esto previene el escenario "WIF-USD huérfano" observado en el log.
+            await asyncio.sleep(2.0)
+            try:
+                verify_resp = await indexer.account.get_subaccount(WALLET_ADDRESS, 0)
+                verify_sub  = verify_resp.get("subaccount", {}) or {}
+                verify_pos  = (
+                    verify_sub.get("openPerpetualPositions", {})
+                    or verify_sub.get("perpetualPositions", {})
+                    or {}
+                )
+                residual_legs = []
+                for check_m, check_side, check_size in [
+                    (m1, close_side_m1, close_size_m1),
+                    (m2, close_side_m2, close_size_m2),
+                ]:
+                    remaining_pos = verify_pos.get(check_m, {})
+                    remaining_sz  = abs(_sf(remaining_pos.get("size", 0.0)))
+                    step = markets.get(check_m, {}).get("stepSize")
+                    min_sz = float(step) if step else 0.001
+                    if remaining_sz > min_sz:
+                        residual_legs.append((check_m, check_side, remaining_sz))
+
+                if residual_legs:
+                    log_event({
+                        "type": "post_close_residual_detected",
+                        "trace_id": trace_id,
+                        "market_1": m1, "market_2": m2,
+                        "close_reason": close_reason,
+                        "residual_legs": [
+                            {"market": m, "side": s, "size": sz}
+                            for m, s, sz in residual_legs
+                        ],
+                    })
+                    # Retry close for each residual leg
+                    for res_m, res_side, res_sz in residual_legs:
+                        try:
+                            await place_market_order(
+                                node, indexer, wallet,
+                                res_m, res_side, res_sz,
+                                markets[res_m]["oraclePrice"],
+                                True,
+                                time_in_force_type=Order.TimeInForce.TIME_IN_FORCE_IOC
+                            )
+                            log_event({
+                                "type": "post_close_retry_sent",
+                                "trace_id": trace_id,
+                                "market": res_m,
+                                "side": res_side,
+                                "size": res_sz,
+                            })
+                        except Exception as retry_err:
+                            log_event({
+                                "type": "post_close_retry_failed",
+                                "trace_id": trace_id,
+                                "market": res_m,
+                                "error": str(retry_err),
+                            })
+                else:
+                    log_event({
+                        "type": "post_close_verified_flat",
+                        "trace_id": trace_id,
+                        "market_1": m1, "market_2": m2,
+                    }, print_terminal=False)
+            except Exception as verify_err:
+                log_event({
+                    "type": "post_close_verify_error",
+                    "trace_id": trace_id,
+                    "market_1": m1, "market_2": m2,
+                    "error": str(verify_err),
+                })
 
             closed_count += 1
 

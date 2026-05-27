@@ -10,15 +10,62 @@ from pprint import pprint
 # Get relevant time periods for ISO from and to
 ISO_TIMES = get_ISO_times()
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Candle cache (2026-05-26)
+# ─────────────────────────────────────────────────────────────────────────────
+# RESOLUTION is "1HOUR" — candles only change at the top of each hour.
+# Cache TTL of 30 min means: within a single hour, we serve cached candles
+# instantly. At next loop iteration after the hour boundary, we refresh.
+#
+# Impact:
+#   - First scan: same speed as before (cache miss for all markets)
+#   - Subsequent scans within the hour: ~5-10 seconds instead of 18 minutes
+#     (no API calls, just dict lookup)
+#
+# Memory: 119 markets × 100 floats × 8 bytes = ~95 KB. Trivial.
+_CANDLE_CACHE = {}  # market_name → (numpy_array, fetch_timestamp_s)
+_CANDLE_CACHE_TTL_S = 30 * 60   # 30 minutes
+
+
+def candle_cache_stats():
+    """Diagnostic: how many markets cached and how old the oldest entry is."""
+    now = time.time()
+    if not _CANDLE_CACHE:
+        return {"size": 0, "oldest_age_s": 0}
+    oldest = min(ts for _, ts in _CANDLE_CACHE.values())
+    return {"size": len(_CANDLE_CACHE), "oldest_age_s": int(now - oldest)}
+
+
+def candle_cache_clear():
+    """Force refresh on next call. Use sparingly (e.g., after long idle)."""
+    _CANDLE_CACHE.clear()
+
+
 # Get Candles recent
 async def get_candles_recent(indexer, market):
     """
     Returns a numpy float64 array of recent close prices (oldest first).
     Returns empty array on error or if the market has no data.
     Never raises.
+
+    2026-05-26: now uses module-level cache with TTL of 30 min.
+    First call per market hits the API; subsequent calls within TTL window
+    return cached array instantly. With RESOLUTION='1HOUR', cache validity
+    matches the data update cycle.
     """
-    # Protect API
-    await asyncio.sleep(0.2)
+    now = time.time()
+
+    # Cache hit?
+    cached = _CANDLE_CACHE.get(market)
+    if cached is not None:
+        arr, ts = cached
+        if now - ts < _CANDLE_CACHE_TTL_S:
+            return arr  # serve from cache, zero API call
+
+    # Cache miss — fetch from API
+    # Reduced sleep from 0.2 → 0.05 because cache hits are now most calls,
+    # so we'd hammer the API far less even at lower delay.
+    await asyncio.sleep(0.05)
 
     try:
         candles_resp = await indexer.markets.get_perpetual_market_candles(
@@ -49,7 +96,11 @@ async def get_candles_recent(indexer, market):
         return np.array([], dtype=np.float64)
 
     close_prices.reverse()  # chronological order
-    return np.array(close_prices, dtype=np.float64)
+    arr = np.array(close_prices, dtype=np.float64)
+
+    # Store in cache for next call
+    _CANDLE_CACHE[market] = (arr, now)
+    return arr
 
 
 # Get Candles Historical

@@ -57,7 +57,13 @@ RISK_OFF_FREE_COLLATERAL_TRIGGER = 25     # 2026-05-26: ajustado a operación $1
 
 # IMPORTANTE: igual a MAX_OPEN_TRADES. Si fuera menor, risk-off dispararía
 # antes de llegar al hard cap y cerraría posiciones sanas.
-RISK_OFF_FORCE_IF_OPEN_TRADES_GE = 1     # 2026-05-26: igualado a MAX_OPEN_TRADES=1
+#
+# 2026-05-26: con MAX_OPEN_TRADES=1 en operación $100, ponerlo en 1 hace que
+# risk-off se evalúe cada vez que abres tu único trade. Aunque el risk_off
+# tiene guardrails (edad, pérdida real, etc.), gasta API calls innecesarias.
+# Lo subo a 99 efectivamente para que SOLO se dispare por el trigger de
+# free collateral bajo (RISK_OFF_FREE_COLLATERAL_TRIGGER), no por hit del cap.
+RISK_OFF_FORCE_IF_OPEN_TRADES_GE = 99    # efectivamente desactivado para $100
 
 # Edad mínima antes de que risk-off pueda cerrar un par.
 # 0.5h = 30 minutos. Protege aperturas muy recientes de cierres forzados inmediatos,
@@ -243,10 +249,10 @@ FIND_COINTEGRATED = False
 COINTEGRATION_REFRESH_HOURS = 6
 
 # Manage exits
-MANAGE_EXITS = False
+MANAGE_EXITS = True
 
 # Place Trades
-PLACE_TRADES = False
+PLACE_TRADES = True
 
 # Resolution
 RESOLUTION = "1HOUR"
@@ -277,6 +283,18 @@ USD_PER_TRADE = 30           # 2026-05-26: fallback if dynamic sizing fails. $30
 USD_MIN_COLLATERAL = 30      # 2026-05-26: Bot puede operar hasta que collateral baje a $30.
                               # Con $100 equity, deja $70 de buffer para variaciones.
                               # Cuando subas equity a $500+: subir a $150.
+
+# ===== Universe Size Limit (2026-05-26) =====
+# Mainnet typically yields 400+ cointegrated pairs. Scanning all takes 15-20min
+# per loop, which is operationally unviable for mean-reversion signals that
+# decay in minutes. Limit to top N by quality score (R² × short-HL × low-Hurst).
+# After candle cache warms up, scans are <30s regardless. But primer scan
+# benefits hugely from this filter.
+#   150 → primer scan ~5 min, scans cacheados ~3-5s
+#   100 → primer scan ~3 min, mismo cache behavior
+#   500 → primer scan ~15 min (efectivamente sin filtro)
+#     0 → desactivado (sin filtro, escanea todos)
+MAX_COINT_PAIRS_TO_SCAN = 150
 
 # Thresholds - Closing
 CLOSE_AT_ZSCORE_CROSS = True
@@ -314,8 +332,10 @@ INDEXER_TESTNET = "https://indexer.v4testnet.dydx.exchange"
 WEBSOCKET_TESTNET = "wss://indexer.v4testnet.dydx.exchange/v4/ws"
 
 # URL ADDRESS MAINNET
+# 2026-05-26: INDEXER sin /v4 al final — la librería dydx-v4-client lo agrega
+# automáticamente. Si pones /v4 aquí, queda /v4/v4/... y devuelve 404.
 NODE_MAINNET = "dydx-ops-grpc.kingnodes.com"
-INDEXER_MAINNET = "https://indexer.dydx.trade/v4"
+INDEXER_MAINNET = "https://indexer.dydx.trade"
 WEBSOCKET_MAINNET = "wss://indexer.dydx.trade/v4/ws"
 
 # URL Selection

@@ -243,6 +243,43 @@ async def open_positions(
         return 0
     df = pd.read_csv(COINT_CSV_PATH)
 
+    # ── 4b. Filter to top-N pairs by quality score (2026-05-26) ────────────
+    # Mainnet has 449+ cointegrated pairs. Scanning all of them takes 18 min
+    # per loop, which is operationally unviable for mean-reversion signals
+    # that decay in minutes. We keep only the top N by a composite quality
+    # score that rewards:
+    #   - High R²        (clean linear cointegration fit)
+    #   - Short half-life (fast mean-reversion → more trades/period)
+    #   - Low Hurst      (strong mean-reversion behavior)
+    #
+    # Score formula: r_squared × (24 / max(1, half_life)) × (1 / max(0.1, hurst))
+    # Higher = better. Top N kept for actual scanning.
+    try:
+        from constants import MAX_COINT_PAIRS_TO_SCAN
+    except ImportError:
+        MAX_COINT_PAIRS_TO_SCAN = 150  # safe default
+
+    _csv_total = len(df)
+    if _csv_total > int(MAX_COINT_PAIRS_TO_SCAN) and MAX_COINT_PAIRS_TO_SCAN > 0:
+        def _coint_quality(row):
+            try:
+                r2 = float(row.get("r_squared", 0) or 0)
+                hl = float(row.get("half_life", 24) or 24)
+                hr = float(row.get("hurst", 0.5) or 0.5)
+                return r2 * (24.0 / max(1.0, hl)) * (1.0 / max(0.1, hr))
+            except Exception:
+                return 0.0
+        df = df.copy()
+        df["_quality"] = df.apply(_coint_quality, axis=1)
+        df = df.sort_values("_quality", ascending=False).head(int(MAX_COINT_PAIRS_TO_SCAN)).reset_index(drop=True)
+        df = df.drop(columns=["_quality"])
+        log_event({
+            "type": "universe_filtered",
+            "csv_total": _csv_total,
+            "kept_top_n": int(MAX_COINT_PAIRS_TO_SCAN),
+            "actual_kept": len(df),
+        }, print_terminal=False)
+
     # ── 5. Market metadata (one API call) ─────────────────────────────────
     markets_response = await indexer.markets.get_perpetual_markets()
     markets = markets_response.get("markets", {}) or {}

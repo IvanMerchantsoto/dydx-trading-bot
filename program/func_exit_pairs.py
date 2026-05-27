@@ -18,7 +18,7 @@ from constants import (
 from func_utils import format_number
 from func_public import get_candles_recent
 from func_cointegration import calculate_zscore
-from func_private import place_market_order, close_pair_maker_with_fallback
+from func_private import place_market_order, close_pair_maker_with_fallback, get_real_fill_details
 from constants import MAKER_EXIT_ENABLED, MAKER_EXIT_TIMEOUT_S
 from func_logging import log_event
 from v4_proto.dydxprotocol.clob.order_pb2 import Order
@@ -494,10 +494,24 @@ async def manage_trade_exits(node, indexer, wallet):
         # In that case, estimate open fees using TAKER_FEE_BPS × open notional
         # so the profit gate isn't too lenient on legacy records.
         open_fees_paid = _sf(position.get("fee_1", 0.0)) + _sf(position.get("fee_2", 0.0))
+        # Bug #4 fix: track whether open fees were estimated. If yes, the cycle's
+        # net_pnl is provisional and must be flagged as such in trade_closed.
+        open_fees_estimated_fallback = False
         if open_fees_paid == 0.0 and total_notional > 0.0:
-            # Estimate: ~0.05% per leg = 0.05% × (notional/2) × 2 legs = 0.05% × notional
             open_fees_paid = total_notional * TAKER_FEE_BPS
+            open_fees_estimated_fallback = True
+        # Also propagate the per-leg fee_estimated flag set at open time (testnet)
+        fee_estimated_at_open = bool(
+            position.get("fee_1_estimated", False)
+            or position.get("fee_2_estimated", False)
+        )
+        # Close fees are always estimated (we haven't sent the close order yet)
         close_fees_est = _estimate_close_fees(live_pos, markets, m1, m2)
+        # pnl_provisional is True whenever ANY component of the fee was estimated.
+        pnl_provisional = open_fees_estimated_fallback or fee_estimated_at_open or True
+        # NOTE: close_fees_est is always estimated pre-close so pnl_provisional stays
+        # True at this stage. After the close, we attempt to fetch real close fees
+        # below and downgrade pnl_provisional to False if successful.
 
         ok_profit, min_gross_required, net_pnl_est = _profit_gate(
             pnl_gross, total_notional, open_fees_paid, close_fees_est
@@ -595,21 +609,20 @@ async def manage_trade_exits(node, indexer, wallet):
                             f"| min_gross={min_gross_required:.2f}"
                         )
                     elif pnl_gross < 0.0:
-                        # ── TP_LOSS_EXIT: z has mean-reverted but position is losing ──
-                        # The spread thesis is done. Holding longer CANNOT improve gross PnL
-                        # if z already reversed — it only bleeds more fees and exposes us to
-                        # further price divergence. Cut the loss now.
-                        is_close = True
-                        tp_loss_exit_count += 1
-                        close_reason = (
-                            f"TP_LOSS_EXIT: z reverted abs(z={z_now:.3f}) <= {Z_TP} "
-                            f"confirms={tp_confirm} "
-                            f"| pnl_gross={pnl_gross:.2f} (negative — cutting loss) "
-                            f"| fees={open_fees_paid + close_fees_est:.2f} "
-                            f"| net_est={net_pnl_est:.2f}"
-                        )
+                        # ── DISABLED 2026-05-21 (Bug #1 fix) ──────────────────
+                        # Antiguo TP_LOSS_EXIT: cerraba pagando fees cuando z revirtió
+                        # pero gross_pnl<0. Análisis del log 2026-05-20/22 mostró que
+                        # 9 de 14 cierres siguieron esta rama y todos terminaron con
+                        # net_pnl_est entre -$1 y -$2 (fees comieron el casi-empate).
+                        #
+                        # Nueva regla: si z revirtió y estamos en pérdida bruta,
+                        # NO cerrar por TP. Mantener la posición y dejar que
+                        # gobiernen HARD_SL (pérdida monetaria absoluta) o Z_SL
+                        # (z se aleja más en contra). Si el spread vuelve a moverse
+                        # a favor, podremos cerrar como TP real cuando ok_profit pase.
+                        tp_blocked_profit_count += 1
                         log_event({
-                            "type": "tp_loss_exit",
+                            "type": "tp_blocked_loss",
                             "trace_id": trace_id,
                             "m1": m1, "m2": m2,
                             "pnl_gross": pnl_gross,
@@ -619,7 +632,8 @@ async def manage_trade_exits(node, indexer, wallet):
                             "z_now": z_now,
                             "z_entry": z_entry,
                             "age_hours": age_hours,
-                        })
+                            "policy": "hold_until_hard_sl_or_zsl",
+                        }, print_terminal=False)
                     else:
                         # pnl_gross > 0 but not enough to cover fees + min net profit yet.
                         # Keep waiting — the spread might improve further.
@@ -713,20 +727,52 @@ async def manage_trade_exits(node, indexer, wallet):
                     net_pnl_est = pnl_gross - (open_fees_paid + close_fees_est)
 
             else:
-                # ── SL / HARD_SL: always MARKET for speed ─────────────────
-                await place_market_order(
+                # ── SL / HARD_SL / TP-without-maker: MARKET IOC for speed ──
+                _close_res_m1 = await place_market_order(
                     node, indexer, wallet,
                     m1, close_side_m1, close_size_m1, markets[m1]["oraclePrice"],
                     True,
                     time_in_force_type=Order.TimeInForce.TIME_IN_FORCE_IOC
                 )
                 await asyncio.sleep(0.5)
-                await place_market_order(
+                _close_res_m2 = await place_market_order(
                     node, indexer, wallet,
                     m2, close_side_m2, close_size_m2, markets[m2]["oraclePrice"],
                     True,
                     time_in_force_type=Order.TimeInForce.TIME_IN_FORCE_IOC
                 )
+                # Bug #7: capture client_ids so we can poll real fees after the close
+                _close_cid_m1 = (_close_res_m1 or {}).get("order", {}).get("id")
+                _close_cid_m2 = (_close_res_m2 or {}).get("order", {}).get("id")
+                try:
+                    if _close_cid_m1 and _close_cid_m2:
+                        # Indexer typically lags 1-2s on fills, sleep before polling
+                        await asyncio.sleep(1.5)
+                        _det_m1 = await get_real_fill_details(indexer, _close_cid_m1, m1, max_fill_lookback=50)
+                        _det_m2 = await get_real_fill_details(indexer, _close_cid_m2, m2, max_fill_lookback=50)
+                        _real_fee_close = _sf(_det_m1.get("fee_total", 0.0)) + _sf(_det_m2.get("fee_total", 0.0))
+                        _close_fee_estimated = bool(_det_m1.get("fee_estimated", True)) or bool(_det_m2.get("fee_estimated", True))
+                        if _real_fee_close > 0:
+                            close_fees_est = _real_fee_close
+                            net_pnl_est = pnl_gross - (open_fees_paid + close_fees_est)
+                            # If neither side is estimated and open also had real fees → no longer provisional
+                            if not _close_fee_estimated and not fee_estimated_at_open:
+                                pnl_provisional = False
+                            log_event({
+                                "type": "close_fees_polled",
+                                "trace_id": trace_id,
+                                "market_1": m1, "market_2": m2,
+                                "fee_close_real": _real_fee_close,
+                                "fee_close_estimated_flag": _close_fee_estimated,
+                                "net_pnl_est_updated": net_pnl_est,
+                            }, print_terminal=False)
+                except Exception as _fe_err:
+                    log_event({
+                        "type": "close_fees_poll_error",
+                        "trace_id": trace_id,
+                        "market_1": m1, "market_2": m2,
+                        "error": str(_fe_err),
+                    }, print_terminal=False)
 
             # ── Post-close verification ──────────────────────────────────
             # Esperar 2s y verificar que ambas legs quedaron flat en el exchange.
@@ -842,6 +888,13 @@ async def manage_trade_exits(node, indexer, wallet):
                 "z_now": z_now,
                 "z_entry": z_entry,
                 "age_hours": age_hours,
+                # Bug #4 fix: explicit provenance flags so audit_run.py
+                # can separate provisional PnL from confirmed PnL.
+                "fee_estimated": bool(fee_estimated_at_open or open_fees_estimated_fallback),
+                "open_fees_estimated_fallback": open_fees_estimated_fallback,
+                "fee_estimated_at_open": fee_estimated_at_open,
+                "pnl_provisional": pnl_provisional,
+                "source": "manage_exits",
             })
 
             # ── Stdout exit log (visible en bot_stdout.log) ───────────────

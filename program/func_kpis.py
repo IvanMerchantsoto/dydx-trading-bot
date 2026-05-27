@@ -17,6 +17,7 @@ import json
 import os
 
 from func_messaging import send_message
+from func_logging import log_event
 from constants import WALLET_ADDRESS
 
 JSON_PATH = os.path.join(os.path.dirname(__file__), "bot_agents.json")
@@ -151,6 +152,32 @@ async def send_account_kpis(indexer, send_telegram: bool = True) -> Optional[Dic
         drift_legs = open_legs_exchange - tracked_markets_json_count
         drift_flag = abs(drift_legs) >= 2
 
+        # ── Leverage and pair count (derived) ─────────────────────────────
+        leverage_used = (notional / equity) if equity > 0 else 0.0
+
+        # ── Bug #5 fix: emit kpi_snapshot as a structured JSON event ──────
+        # This is the audit-time source of truth for equity/PnL trajectory.
+        # audit_run.py and SOP procedure §7.1 consume this event.
+        log_event({
+            "type": "kpi_snapshot",
+            "equity": equity,
+            "free_collateral": free,
+            "margin_reported": margin_reported,
+            "used_collateral_est": used_collateral_est,
+            "used_collateral_ratio": used_collateral_ratio,
+            "notional_gross": notional,
+            "leverage_used": leverage_used,
+            "unrealized_pnl": unreal,
+            "open_legs_exchange": int(open_legs_exchange),
+            "open_pairs_exchange_est": float(open_pairs_exchange_est),
+            "open_pairs_json": tracked_pairs_json,
+            "tracked_markets_json": tracked_markets_json_count,
+            "needs_reconcile": reconcile_required,
+            "orphan_count": orphan_count,
+            "drift_legs": drift_legs,
+            "drift_flag": bool(drift_flag),
+        }, print_terminal=False)
+
         if send_telegram:
             msg = (
                 "📊 *DYDX Snapshot*\n"
@@ -158,6 +185,7 @@ async def send_account_kpis(indexer, send_telegram: bool = True) -> Optional[Dic
                 f"Free collateral: ${free:,.2f}\n"
                 f"Used collateral (est): ${used_collateral_est:,.2f} ({used_collateral_ratio*100:.1f}% of equity)\n"
                 f"Open notional (oracle): ${notional:,.2f}\n"
+                f"Leverage used: {leverage_used:.2f}x\n"
                 f"Unrealized PnL: ${unreal:,.2f}\n"
                 f"Exchange open legs: {open_legs_exchange}\n"
                 f"Tracked pairs (JSON): {tracked_pairs_json}\n"
@@ -179,6 +207,7 @@ async def send_account_kpis(indexer, send_telegram: bool = True) -> Optional[Dic
             "used_collateral_est": used_collateral_est,
             "used_collateral_ratio": used_collateral_ratio,
             "notional": notional,
+            "leverage_used": leverage_used,
             "unreal": unreal,
             "open_legs_exchange": float(open_legs_exchange),
             "open_pairs_exchange_est": float(open_pairs_exchange_est),

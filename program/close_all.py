@@ -32,7 +32,8 @@ from func_messaging import send_message
 from func_logging import log_event
 from func_utils import format_number
 from v4_proto.dydxprotocol.clob.order_pb2 import Order
-from constants import WALLET_ADDRESS, UNMANAGED_IGNORE_MARKETS
+from constants import WALLET_ADDRESS, UNMANAGED_IGNORE_MARKETS, TAKER_FEE_BPS
+from func_pnl import leg_pnl
 
 JSON_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_agents.json")
 
@@ -118,8 +119,97 @@ async def close_position(node, indexer, wallet, market, pos_info, markets_data, 
         return {"market": market, "closed": False, "error": str(e)}
 
 
-def clean_bot_agents_json(closed_markets: set):
-    """Remove JSON records whose markets have been closed."""
+def emit_synthetic_trade_closed_for_pair(record: dict, positions: dict, closed_markets: set):
+    """
+    Bug #6 fix: emit a trade_closed event for each pair whose markets are
+    being closed by close_all.py. Without this, close_all PnL is invisible
+    to audit_run.py and session_summary accounting.
+
+    The pair is considered closed if AT LEAST one of its legs was closed.
+    We compute pnl_gross using the entry prices stored in bot_agents.json
+    and the oracle prices at close (captured before the orders went out).
+    """
+    m1 = record.get("market_1", "")
+    m2 = record.get("market_2", "")
+    if not m1 or not m2:
+        return
+
+    # Only emit if at least one leg was actually closed
+    if m1 not in closed_markets and m2 not in closed_markets:
+        return
+
+    trace_id = record.get("trace_id")
+
+    entry1_side = record.get("side_1") or record.get("entry_side_1")
+    entry2_side = record.get("side_2") or record.get("entry_side_2")
+    try:
+        entry1_price = float(record.get("price_1") or record.get("entry_price_1") or 0)
+        entry2_price = float(record.get("price_2") or record.get("entry_price_2") or 0)
+        entry1_size  = float(record.get("size_1") or record.get("entry_size_1") or 0)
+        entry2_size  = float(record.get("size_2") or record.get("entry_size_2") or 0)
+    except Exception:
+        entry1_price = entry2_price = entry1_size = entry2_size = 0.0
+
+    close_px_m1 = positions.get(m1, {}).get("oracle_price", 0.0) if m1 in positions else entry1_price
+    close_px_m2 = positions.get(m2, {}).get("oracle_price", 0.0) if m2 in positions else entry2_price
+
+    pnl_gross_1 = pnl_gross_2 = 0.0
+    if entry1_side and entry1_price > 0 and close_px_m1 > 0:
+        pnl_gross_1 = leg_pnl(entry1_side, entry1_price, close_px_m1, entry1_size)
+    if entry2_side and entry2_price > 0 and close_px_m2 > 0:
+        pnl_gross_2 = leg_pnl(entry2_side, entry2_price, close_px_m2, entry2_size)
+    pnl_gross_total = pnl_gross_1 + pnl_gross_2
+
+    open_fees_paid = _sf(record.get("fee_1", 0.0)) + _sf(record.get("fee_2", 0.0))
+
+    # Estimate close fees from the size that was actually closed (oracle × taker bps)
+    close_notional = 0.0
+    if m1 in closed_markets and close_px_m1 > 0:
+        close_notional += abs(entry1_size) * close_px_m1
+    if m2 in closed_markets and close_px_m2 > 0:
+        close_notional += abs(entry2_size) * close_px_m2
+    close_fees_est = close_notional * float(TAKER_FEE_BPS)
+
+    net_pnl_est = pnl_gross_total - open_fees_paid - close_fees_est
+
+    fee_estimated_at_open = bool(
+        record.get("fee_1_estimated", False) or record.get("fee_2_estimated", False)
+    )
+    # Whether the pair was fully closed (both legs) or only one
+    both_closed = (m1 in closed_markets and m2 in closed_markets)
+    one_leg_only = not both_closed
+
+    log_event({
+        "type": "trade_closed",
+        "trace_id": trace_id,
+        "market_1": m1,
+        "market_2": m2,
+        "close_reason": "CLOSE_ALL: bulk close via close_all.py" + (
+            f" (one_leg_only: m1_closed={m1 in closed_markets} m2_closed={m2 in closed_markets})"
+            if one_leg_only else ""
+        ),
+        "close_type_m1": "taker",
+        "close_type_m2": "taker",
+        "pnl_gross": pnl_gross_total,
+        "pnl_gross_leg_1": pnl_gross_1,
+        "pnl_gross_leg_2": pnl_gross_2,
+        "open_fees": open_fees_paid,
+        "close_fees_est": close_fees_est,
+        "net_pnl_est": net_pnl_est,
+        "fee_estimated": fee_estimated_at_open,
+        "pnl_provisional": True,  # always provisional: we lose track of orphan leg PnL otherwise
+        "synthetic": True,
+        "source": "close_all",
+        "both_legs_closed": both_closed,
+    })
+
+
+def clean_bot_agents_json(closed_markets: set, positions: dict):
+    """Remove JSON records whose markets have been closed.
+
+    Also emits a synthetic trade_closed event per affected pair so that
+    audit_run.py and session_summary include close_all PnL.
+    """
     try:
         with open(JSON_PATH, "r") as f:
             records = json.load(f)
@@ -132,6 +222,17 @@ def clean_bot_agents_json(closed_markets: set):
         m1 = r.get("market_1", "")
         m2 = r.get("market_2", "")
         if m1 in closed_markets or m2 in closed_markets:
+            # Bug #6 fix: emit synthetic trade_closed before discarding
+            try:
+                emit_synthetic_trade_closed_for_pair(r, positions, closed_markets)
+            except Exception as ee:
+                log_event({
+                    "type": "trade_closed_emit_error",
+                    "trace_id": r.get("trace_id"),
+                    "market_1": m1, "market_2": m2,
+                    "source": "close_all",
+                    "error": str(ee),
+                })
             removed += 1
         else:
             kept.append(r)
@@ -209,7 +310,7 @@ async def run(args):
     # ── Clean JSON ──
     if not dry_run and not keep_json and closed_ok:
         print("\nCleaning bot_agents.json...")
-        clean_bot_agents_json(set(closed_ok))
+        clean_bot_agents_json(set(closed_ok), positions)
 
     # ── Telegram summary ──
     if not dry_run:

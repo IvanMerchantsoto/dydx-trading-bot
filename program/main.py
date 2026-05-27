@@ -236,7 +236,15 @@ async def main():
 
                     # Risk-off by free collateral
                     if RISK_OFF_ENABLED and snapshot.get("free", 0) < float(RISK_OFF_FREE_COLLATERAL_TRIGGER):
-                        await risk_off_close_worst_pair(node, indexer, wallet)
+                        _ro_res = await risk_off_close_worst_pair(node, indexer, wallet)
+                        # Bug #2 fix: accumulate RISK_OFF PnL into session_stats so it
+                        # appears in session_summary and Telegram digests.
+                        if isinstance(_ro_res, dict) and _ro_res.get("closed"):
+                            session_stats["total_closed"] = session_stats.get("total_closed", 0) + 1
+                            session_stats["net_pnl_est_sum"] = (
+                                session_stats.get("net_pnl_est_sum", 0.0)
+                                + float(_ro_res.get("net_pnl_est", 0.0))
+                            )
 
             except Exception as e:
                 print(f"[D4] KPI error: {e}", flush=True)
@@ -296,13 +304,109 @@ async def main():
                 import json as _json
                 _json_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_agents.json")
                 print(f"[D5] reading JSON from {_json_path}", flush=True)
+
+                # ── JSON-side count (what the bot thinks it has) ───────────
                 try:
                     with open(_json_path) as _f:
                         _records = _json.load(_f)
-                    open_pairs = len([r for r in _records if isinstance(r, dict)])
+                    json_pairs = len([r for r in _records if isinstance(r, dict)])
+                    json_orphans = len([
+                        r for r in _records
+                        if isinstance(r, dict)
+                        and str(r.get("pair_status", "")).upper() in ("ORPHAN", "FAILED", "ERROR")
+                    ])
                 except Exception as je:
                     print(f"[D5] JSON read error: {je}", flush=True)
-                    open_pairs = 0
+                    _records = []
+                    json_pairs = 0
+                    json_orphans = 0
+
+                # ── Real cap (Bug #3 fix, refined 2026-05-25) ───────────────
+                # Cap must consider:
+                #   (a) JSON pair count               (bot's view of LIVE pairs)
+                #   (b) Real open positions / 2       (exchange view: pairs implied by
+                #                                      legs that the bot CAN manage —
+                #                                      excludes UNMANAGED_IGNORE_MARKETS)
+                #   (c) Orphan records in JSON         (each orphan ties up exposure)
+                # We use max(a, b) + orphans as the effective open_pairs count.
+                #
+                # IMPORTANT: markets in UNMANAGED_IGNORE_MARKETS are by definition
+                # "do not manage". They are stuck testnet positions that the bot
+                # cannot close (no liquidity). They MUST NOT count toward the cap,
+                # otherwise their persistent presence permanently caps the bot at
+                # 0 new trades (observed 2026-05-22 in run-d780831c log: 9 stuck legs
+                # → real_pairs=5 → max_open=5 → 95% of loops in "at cap" state →
+                # only 7 candidate scans in 2 hours).
+                # Dust threshold: positions with notional < $5 USD are not "real" pairs.
+                # Must match func_position_guard.MIN_POSITION_USD_TO_CARE so the two views
+                # of position count (reconcile_state vs open_pairs_cap_check) stay consistent.
+                # Observed 2026-05-25: the TON-USD/MET-USD failure left $6 of dust that
+                # the reconcile_state filtered but our cap_check counted, inflating
+                # effective_open_pairs by 2 phantom pairs.
+                _DUST_USD = 5.0
+
+                real_open_pairs_estimate = 0
+                _real_legs = 0
+                _ignored_legs = 0
+                _dust_legs = 0
+                try:
+                    _resp = await indexer.account.get_subaccount(WALLET_ADDRESS.strip(), 0)
+                    _sub = _resp.get("subaccount", {}) or {}
+                    _equity = float(_sub.get("equity") or 0)
+                    _positions = (
+                        _sub.get("openPerpetualPositions", {})
+                        or _sub.get("perpetualPositions", {})
+                        or {}
+                    )
+                    # Get oracle prices once to compute notional per leg
+                    try:
+                        _mk_resp = await indexer.markets.get_perpetual_markets()
+                        _markets_map = _mk_resp.get("markets", {}) or {}
+                    except Exception:
+                        _markets_map = {}
+
+                    if isinstance(_positions, dict):
+                        for _m, _p in _positions.items():
+                            if not isinstance(_p, dict):
+                                continue
+                            try:
+                                _sz = float(_p.get("size", 0))
+                            except Exception:
+                                continue
+                            if abs(_sz) <= 1e-9:
+                                continue
+                            # Skip stuck unmanaged exposure (excluded by config)
+                            if _m in UNMANAGED_IGNORE_MARKETS:
+                                _ignored_legs += 1
+                                continue
+                            # Skip dust positions (consistent with reconcile_state)
+                            try:
+                                _px = float((_markets_map.get(_m, {}) or {}).get("oraclePrice", 0))
+                            except Exception:
+                                _px = 0.0
+                            _notional = abs(_sz) * _px if _px > 0 else 0.0
+                            if _notional < _DUST_USD:
+                                _dust_legs += 1
+                                continue
+                            _real_legs += 1
+                    # Each pair has 2 manageable legs; round up to be conservative.
+                    real_open_pairs_estimate = (_real_legs + 1) // 2
+                except Exception as eq_e:
+                    print(f"[D5] subaccount read error (real_cap fallback to JSON): {eq_e}", flush=True)
+                    _equity = 0.0
+
+                open_pairs = max(json_pairs, real_open_pairs_estimate) + json_orphans
+
+                log_event({
+                    "type": "open_pairs_cap_check",
+                    "json_pairs": json_pairs,
+                    "json_orphans": json_orphans,
+                    "real_manageable_legs": _real_legs,
+                    "ignored_unmanaged_legs": _ignored_legs,
+                    "dust_legs_ignored": _dust_legs,
+                    "real_open_pairs_estimate": real_open_pairs_estimate,
+                    "effective_open_pairs": open_pairs,
+                }, print_terminal=False)
 
                 # ── Dynamic sizing ─────────────────────────────────────────
                 eff_usd_per_trade = float(USD_PER_TRADE)
@@ -310,9 +414,6 @@ async def main():
 
                 if DYNAMIC_SIZING:
                     try:
-                        _resp = await indexer.account.get_subaccount(WALLET_ADDRESS.strip(), 0)
-                        _sub = _resp.get("subaccount", {}) or {}
-                        _equity = float(_sub.get("equity") or 0)
                         if _equity > 0:
                             eff_usd_per_trade, eff_max_open = _compute_dynamic_sizing(_equity)
                             log_event({
@@ -324,8 +425,8 @@ async def main():
                     except Exception as ds_e:
                         print(f"[D5] dynamic sizing error (using defaults): {ds_e}", flush=True)
 
-                print(f"[D5] open_pairs={open_pairs} max={eff_max_open} "
-                      f"usd={eff_usd_per_trade:.0f} batch={opened_since_exit}/{BATCH_OPEN_TRADES}", flush=True)
+                print(f"[D5] open_pairs={open_pairs} (json={json_pairs} real={real_open_pairs_estimate} orphans={json_orphans}) "
+                      f"max={eff_max_open} usd={eff_usd_per_trade:.0f} batch={opened_since_exit}/{BATCH_OPEN_TRADES}", flush=True)
 
                 # ── Drawdown halt check ────────────────────────────────────
                 if DRAWDOWN_CIRCUIT_BREAKER_ENABLED and drawdown_halt_until > now:
@@ -340,7 +441,14 @@ async def main():
                 elif open_pairs >= eff_max_open:
                     print("[D5] at cap — skipping open", flush=True)
                     if RISK_OFF_ENABLED and open_pairs >= RISK_OFF_FORCE_IF_OPEN_TRADES_GE:
-                        await risk_off_close_worst_pair(node, indexer, wallet)
+                        _ro_res = await risk_off_close_worst_pair(node, indexer, wallet)
+                        # Bug #2 fix: accumulate the same way as above
+                        if isinstance(_ro_res, dict) and _ro_res.get("closed"):
+                            session_stats["total_closed"] = session_stats.get("total_closed", 0) + 1
+                            session_stats["net_pnl_est_sum"] = (
+                                session_stats.get("net_pnl_est_sum", 0.0)
+                                + float(_ro_res.get("net_pnl_est", 0.0))
+                            )
 
                 else:
                     # ── Real reconcile gate (dYdX as source of truth) ──────

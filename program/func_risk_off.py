@@ -31,6 +31,7 @@ from constants import (
     RISK_SCORE_W_ABS_Z,
     RISK_SCORE_W_UNREAL_PNL,
     RISK_OFF_MIN_AGE_HOURS,
+    TAKER_FEE_BPS,
 )
 from func_public import get_candles_recent
 from func_cointegration import calculate_zscore
@@ -303,6 +304,10 @@ async def risk_off_close_worst_pair(node, indexer, wallet):
         if step_m2:
             qty_m2 = float(format_number(qty_m2, step_m2))
 
+        # Capture close-side market prices for PnL accounting (before placing orders)
+        close_px_m1 = _sf(markets.get(m1, {}).get("oraclePrice"))
+        close_px_m2 = _sf(markets.get(m2, {}).get("oraclePrice"))
+
         await place_market_order(
             node, indexer, wallet,
             m1, side_m1, qty_m1, markets[m1]["oraclePrice"],
@@ -318,12 +323,86 @@ async def risk_off_close_worst_pair(node, indexer, wallet):
         # Remove closed pair from JSON (atomic)
         remaining = []
         removed = False
+        closed_record = None
         for row in trades:
             if row.get("market_1") == m1 and row.get("market_2") == m2 and not removed:
                 removed = True
+                closed_record = row
                 continue
             remaining.append(row)
         _save_trades(remaining)
+
+        # ── Synthetic trade_closed event (Bug #2 fix) ─────────────────────
+        # risk_off MUST emit a trade_closed so its PnL is counted in
+        # session_stats.net_pnl_est_sum. Without this, the bot's accounting
+        # ignores all RISK_OFF closes (analysis of 2026-05-20 log: ~$0-50
+        # of RISK_OFF closes silently disappeared from realized_pnl_run).
+        try:
+            from func_pnl import leg_pnl  # local import to avoid circular at module load
+
+            entry1_side = closed_record.get("side_1") or closed_record.get("entry_side_1") if closed_record else None
+            entry2_side = closed_record.get("side_2") or closed_record.get("entry_side_2") if closed_record else None
+            entry1_price = _sf(closed_record.get("price_1") or closed_record.get("entry_price_1"), 0.0) if closed_record else 0.0
+            entry2_price = _sf(closed_record.get("price_2") or closed_record.get("entry_price_2"), 0.0) if closed_record else 0.0
+            entry1_size = _sf(closed_record.get("size_1") or closed_record.get("entry_size_1"), 0.0) if closed_record else 0.0
+            entry2_size = _sf(closed_record.get("size_2") or closed_record.get("entry_size_2"), 0.0) if closed_record else 0.0
+
+            pnl_gross_1 = pnl_gross_2 = 0.0
+            if closed_record and entry1_side and entry2_side and entry1_price > 0 and entry2_price > 0:
+                pnl_gross_1 = leg_pnl(entry1_side, entry1_price, close_px_m1, entry1_size)
+                pnl_gross_2 = leg_pnl(entry2_side, entry2_price, close_px_m2, entry2_size)
+            # Fallback: use indexer unrealizedPnl that we already have if entry data missing
+            pnl_gross_total = pnl_gross_1 + pnl_gross_2 if (pnl_gross_1 or pnl_gross_2) else float(unreal)
+
+            open_fees_paid = (_sf((closed_record or {}).get("fee_1", 0.0))
+                              + _sf((closed_record or {}).get("fee_2", 0.0)))
+            # Estimate close fees from notional × taker fee bps
+            close_notional = (qty_m1 * close_px_m1 if close_px_m1 > 0 else 0.0) \
+                           + (qty_m2 * close_px_m2 if close_px_m2 > 0 else 0.0)
+            close_fees_est = close_notional * float(TAKER_FEE_BPS)
+
+            net_pnl_est = pnl_gross_total - open_fees_paid - close_fees_est
+
+            # fee_estimated flag from record (legacy positions or testnet)
+            fee_estimated_flag = bool(
+                (closed_record or {}).get("fee_1_estimated", False)
+                or (closed_record or {}).get("fee_2_estimated", False)
+            )
+
+            log_event({
+                "type": "trade_closed",
+                "trace_id": trace_id,
+                "market_1": m1,
+                "market_2": m2,
+                "close_reason": (
+                    f"RISK_OFF: score={score:.2f} | loss_component={breakdown['loss_component']:.2f} "
+                    f"| z_component={breakdown['z_component']:.2f} | stale_bonus={breakdown['stale_bonus']:.2f} "
+                    f"| emergency={emergency} | unreal=${unreal:.2f} | abs_z={absz:.2f} | age={age_hours:.2f}h"
+                ),
+                "close_type_m1": "taker",
+                "close_type_m2": "taker",
+                "pnl_gross": pnl_gross_total,
+                "open_fees": open_fees_paid,
+                "close_fees_est": close_fees_est,
+                "net_pnl_est": net_pnl_est,
+                "fee_estimated": fee_estimated_flag,
+                "pnl_provisional": fee_estimated_flag,
+                "z_now": None,  # z was computed earlier in the scoring loop but not retained per-trade here
+                "z_entry": _sf((closed_record or {}).get("z_score", 0.0)),
+                "age_hours": age_hours,
+                "synthetic": True,
+                "source": "risk_off",
+            })
+        except Exception as tc_err:
+            log_event({
+                "type": "trade_closed_emit_error",
+                "trace_id": trace_id,
+                "market_1": m1, "market_2": m2,
+                "source": "risk_off",
+                "error": str(tc_err),
+            })
+            # Don't fail the close just because the event emission failed
+            net_pnl_est = float(unreal)  # best-effort fallback for caller
 
         log_event({
             "type": "risk_off_closed",
@@ -335,8 +414,20 @@ async def risk_off_close_worst_pair(node, indexer, wallet):
             "removed_from_json": removed,
         })
 
-        send_message(f"Risk-off closed: {m1}/{m2} | Unreal: ${unreal:,.2f}")
-        return True
+        send_message(
+            f"🛑 RISK-OFF closed: {m1}/{m2}\n"
+            f"Unreal: ${unreal:,.2f} | Net est (incl fees): ${net_pnl_est:+.2f}\n"
+            f"Reason: score={score:.2f} loss={breakdown['loss_component']:.2f} z={breakdown['z_component']:.2f}"
+        )
+        # Return a dict so main.py can accumulate to session_stats
+        return {
+            "closed": True,
+            "trace_id": trace_id,
+            "market_1": m1,
+            "market_2": m2,
+            "net_pnl_est": float(net_pnl_est),
+            "unreal": float(unreal),
+        }
 
     except Exception as e:
         log_event({

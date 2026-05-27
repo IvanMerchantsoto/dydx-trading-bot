@@ -27,7 +27,11 @@ from func_private import (
 )
 from func_position_guard import get_live_positions
 from func_public import get_market_spread_bps
-from constants import MAX_ENTRY_SPREAD_BPS
+from constants import (
+    SPREAD_GATE_MAX_PCT_OF_EDGE,
+    SPREAD_GATE_PER_LEG_FLOOR_BPS,
+    SPREAD_GATE_PER_LEG_CEILING_BPS,
+)
 
 
 def _sf(x, d=0.0):
@@ -58,6 +62,7 @@ class BotAgent:
         min_m1_fill_usd=50.0,
         min_m1_fill_ratio=0.05,
         intended_usd_per_trade=None,
+        expected_edge_usd=0.0,       # 2026-05-26: needed for dynamic spread gate
         prepare_price_bps=2000,      # 20% lejos del oracle para no ejecutar
         prepare_good_til_blocks=2,   # expira solo, no depende de cancel
         prepare_visible_timeout_s=6.0,
@@ -86,6 +91,7 @@ class BotAgent:
         self.min_m1_fill_usd = float(min_m1_fill_usd)
         self.min_m1_fill_ratio = float(min_m1_fill_ratio)
         self.intended_usd_per_trade = float(intended_usd_per_trade) if intended_usd_per_trade is not None else None
+        self.expected_edge_usd = float(expected_edge_usd) if expected_edge_usd is not None else 0.0
 
         self.prepare_price_bps = int(prepare_price_bps)
         self.prepare_good_til_blocks = int(prepare_good_til_blocks)
@@ -314,52 +320,116 @@ class BotAgent:
             return self.order_dict
 
         # =========================================================
-        # SPREAD CHECK (pre-COMMIT liquidity gate)
+        # SPREAD CHECK (pre-COMMIT gate, DYNAMIC since 2026-05-26)
         # =========================================================
-        # Fetch live orderbook for both legs. If either has a bid-ask
-        # spread wider than MAX_ENTRY_SPREAD_BPS, abort WITHOUT placing
-        # MARKET orders → zero fees paid (PREPARE orders already expired).
+        # Fetch live orderbook for both legs and decide whether the cost of
+        # crossing both books (entry + exit, both legs) is acceptable given
+        # the expected edge of THIS specific trade.
         #
-        # On indexer error: proceed (we never block on missing data).
-        # On spread = None: proceed (treat as data-unavailable, not wide).
-        if MAX_ENTRY_SPREAD_BPS > 0:
-            try:
-                spread1, spread2 = await asyncio.gather(
-                    get_market_spread_bps(self.indexer, self.market_1),
-                    get_market_spread_bps(self.indexer, self.market_2),
+        # Formula:
+        #   spread_cost_usd = (s1 + s2) × notional_per_leg / 10000
+        #   (derived from: 2 legs × 2 sides × half_spread × notional)
+        #
+        # Three-phase decision (see constants.py for details):
+        #   1. FLOOR pass — both legs ≤ FLOOR_BPS → permit unconditionally
+        #   2. CEILING block — any leg > CEILING_BPS → reject unconditionally
+        #   3. EDGE-PROPORTIONAL — spread_cost ≤ MAX_PCT × expected_edge_usd
+        #
+        # On indexer error: proceed (never block on missing data).
+        # On spread = None: treat as data-unavailable; only floor pass can succeed.
+        try:
+            spread1, spread2 = await asyncio.gather(
+                get_market_spread_bps(self.indexer, self.market_1),
+                get_market_spread_bps(self.indexer, self.market_2),
+            )
+
+            floor_bps = float(SPREAD_GATE_PER_LEG_FLOOR_BPS)
+            ceiling_bps = float(SPREAD_GATE_PER_LEG_CEILING_BPS)
+            max_pct = float(SPREAD_GATE_MAX_PCT_OF_EDGE)
+            notional_per_leg = float(self.intended_usd_per_trade or 0.0)
+            edge_usd = float(self.expected_edge_usd or 0.0)
+
+            # Phase 1: floor pass
+            s1_below_floor = (spread1 is None) or (spread1 <= floor_bps)
+            s2_below_floor = (spread2 is None) or (spread2 <= floor_bps)
+            phase1_pass = s1_below_floor and s2_below_floor
+
+            # Phase 2: ceiling block (only meaningful if spreads are known)
+            s1_above_ceiling = (spread1 is not None) and (spread1 > ceiling_bps)
+            s2_above_ceiling = (spread2 is not None) and (spread2 > ceiling_bps)
+            phase2_block = s1_above_ceiling or s2_above_ceiling
+
+            # Phase 3: edge-proportional cost check
+            # Use 0 for None spread (best case — book might not be wide, just unknown)
+            s1_val = float(spread1) if spread1 is not None else 0.0
+            s2_val = float(spread2) if spread2 is not None else 0.0
+            spread_cost_usd = (s1_val + s2_val) * notional_per_leg / 10000.0
+            max_cost_usd = max_pct * edge_usd if edge_usd > 0 else 0.0
+            edge_check_known = edge_usd > 0
+            phase3_pass = edge_check_known and (spread_cost_usd <= max_cost_usd)
+
+            # Decision
+            if phase1_pass:
+                passed = True
+                rule = "floor_pass"
+                reason = ""
+            elif phase2_block:
+                passed = False
+                rule = "ceiling_block"
+                wide_m = self.market_1 if s1_above_ceiling else self.market_2
+                wide_bps = spread1 if s1_above_ceiling else spread2
+                reason = f"SPREAD_CEILING: {wide_m} {wide_bps:.1f}bps > {ceiling_bps:.0f}bps"
+            elif phase3_pass:
+                passed = True
+                rule = "edge_pct_pass"
+                reason = ""
+            elif edge_check_known:
+                passed = False
+                rule = "edge_pct_block"
+                reason = (
+                    f"SPREAD_COST_EXCEEDS_EDGE_PCT: cost=${spread_cost_usd:.2f} "
+                    f"> max=${max_cost_usd:.2f} ({max_pct*100:.0f}% of edge=${edge_usd:.2f}) "
+                    f"| s1={s1_val:.1f}bps s2={s2_val:.1f}bps"
                 )
+            else:
+                # No edge info AND not in floor pass AND not ceiling block.
+                # Fall back to ceiling-only behavior: permit (we already passed ceiling).
+                passed = True
+                rule = "no_edge_data_fallback_to_ceiling"
+                reason = ""
 
-                s1_ok = spread1 is None or spread1 <= MAX_ENTRY_SPREAD_BPS
-                s2_ok = spread2 is None or spread2 <= MAX_ENTRY_SPREAD_BPS
+            log_event({
+                "type": "spread_check",
+                "trace_id": self.trace_id,
+                "market_1": self.market_1,
+                "market_2": self.market_2,
+                "spread_1_bps": round(spread1, 2) if spread1 is not None else None,
+                "spread_2_bps": round(spread2, 2) if spread2 is not None else None,
+                "notional_per_leg": notional_per_leg,
+                "expected_edge_usd": round(edge_usd, 4),
+                "spread_cost_usd": round(spread_cost_usd, 4),
+                "max_cost_usd": round(max_cost_usd, 4),
+                "floor_bps": floor_bps,
+                "ceiling_bps": ceiling_bps,
+                "max_pct_of_edge": max_pct,
+                "rule": rule,
+                "passed": passed,
+            })
 
-                log_event({
-                    "type": "spread_check",
-                    "trace_id": self.trace_id,
-                    "market_1": self.market_1,
-                    "market_2": self.market_2,
-                    "spread_1_bps": round(spread1, 2) if spread1 is not None else None,
-                    "spread_2_bps": round(spread2, 2) if spread2 is not None else None,
-                    "max_bps": MAX_ENTRY_SPREAD_BPS,
-                    "passed": s1_ok and s2_ok,
-                })
+            if not passed:
+                self.order_dict["pair_status"] = "SKIPPED"
+                self.order_dict["comments"] = reason
+                return self.order_dict
 
-                if not s1_ok or not s2_ok:
-                    wide_m = self.market_1 if not s1_ok else self.market_2
-                    wide_bps = spread1 if not s1_ok else spread2
-                    reason = f"SPREAD_TOO_WIDE: {wide_m} {wide_bps:.1f}bps > {MAX_ENTRY_SPREAD_BPS}bps"
-                    self.order_dict["pair_status"] = "SKIPPED"
-                    self.order_dict["comments"] = reason
-                    return self.order_dict
-
-            except Exception as e:
-                # Spread check itself failed — log and proceed to COMMIT.
-                # Never let an instrumentation failure block a trade.
-                log_event({
-                    "type": "spread_check_error",
-                    "trace_id": self.trace_id,
-                    "error": str(e),
-                    "msg": "Spread check exception — proceeding to COMMIT",
-                })
+        except Exception as e:
+            # Spread check itself failed — log and proceed to COMMIT.
+            # Never let an instrumentation failure block a trade.
+            log_event({
+                "type": "spread_check_error",
+                "trace_id": self.trace_id,
+                "error": str(e),
+                "msg": "Spread check exception — proceeding to COMMIT",
+            })
 
         # =========================================================
         # PHASE 2: COMMIT

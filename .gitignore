@@ -37,3 +37,13 @@ build/
 backups/
 *.bak
 *.tmp
+.env
+.env.*
+__pycache__/
+.venv/
+*.pyc
+bot_run.log*.jsonl
+bot_stdout*.log
+bot_agents.json
+pair_fail_cooldowns.json
+backtest_cache/

@@ -38,9 +38,13 @@ PAIR_FAIL_RESET_ON_SUCCESS = True   # resetear contador si hay LIVE
 # Máximo de pares abiertos que pueden compartir el mismo mercado.
 # Evita que ARKM-USD (presente en 9+ pares del CSV) bloquee todas las señales
 # en cuanto 1 par con ARKM está abierto.
-# Con MAX_TRADES_PER_MARKET=1: si ADA-USD ya está en un par activo, no se abre
-# otro par que use ADA-USD, aunque tenga z muy alto.
-MAX_TRADES_PER_MARKET = 1
+#
+# 2026-05-26: subido de 1 → 2. Análisis del log mostró que MAX=1 combinado con
+# 13 pares manuales del usuario filtraba 47 de 144 pares del CSV (33%).
+# MAX=2 permite mejor utilización del universe pero introduce correlación:
+# si SOL-USD aparece en 2 pares activos, un movimiento adverso en SOL pega
+# en ambos a la vez. Riesgo monitoreado via HARD_SL_USD por par.
+MAX_TRADES_PER_MARKET = 2
 
 
 def _pair_key(m1, m2):
@@ -263,7 +267,17 @@ async def open_positions(
         val = m_data.get("minOrderSize") or m_data.get("stepSize")
         return float(val) if val else 0.0
 
-    MAX_PRICE_RATIO = 50.0
+    # MAX_PRICE_RATIO: filtro contra pares con asimetría extrema de precio.
+    # 50 era el valor inicial (commit 37659ea).
+    #
+    # 2026-05-26: subido de 50 a 200. Análisis del log 2026-05-25 mostró que
+    # MAX=50 filtraba 33 de 144 pares del CSV (23%) — incluyendo pares con
+    # precios diversos pero hedge_ratio sano (ya protegido por HEDGE_RATIO_LOG_MAX
+    # = 3.5). MAX=200 permite pares hasta ratio 200 (ej. SOL $150 / mid-cap $1).
+    # Pares con ratio > 200 (mostly BTC/altcoin nano-cap) siguen filtrados, lo
+    # cual es correcto: ahí el min order size de dYdX hace imposible operar.
+    # La protección real contra pares espurios sigue siendo HEDGE_RATIO_LOG_MAX.
+    MAX_PRICE_RATIO = 200.0
 
     # ══════════════════════════════════════════════════════════════════════
     # PHASE 1: Collect and score all candidates
@@ -372,6 +386,24 @@ async def open_positions(
             z_score = float(calculate_zscore(spread).values.tolist()[-1])
         except Exception:
             _skip_candles += 1
+            continue
+
+        # 2026-05-26: guard against NaN/Inf z-score.
+        # calculate_zscore divides (x - rolling_mean) / rolling_std. When the
+        # spread is constant (or warmup window not full), std=0 → z=NaN.
+        # Without this guard, NaN slipped past the |z| < THRESH check (because
+        # NaN comparisons are always False), reached the candidates list, and
+        # showed up as "edge=$0.00 < required=$5.00 z=nan" in the log over
+        # and over for the same pair, wasting scan cycles.
+        if not math.isfinite(z_score):
+            _skip_candles += 1
+            log_event({
+                "type": "signal_skip",
+                "reason": "zscore_not_finite",
+                "base": base_market,
+                "quote": quote_market,
+                "z_score": "nan" if math.isnan(z_score) else "inf",
+            }, print_terminal=False)
             continue
 
         if abs(z_score) > _max_z_seen:
@@ -632,6 +664,14 @@ async def open_positions(
         print(f"[ENTRY] Opening trade for {base_market} and {quote_market} "
               f"(score={cand['score']:.4f} z={z_score:.3f} hl={half_life})...")
 
+        # 2026-05-26: min_m1_fill_usd dinámico, escalado al tamaño del trade.
+        # Default era 50.0 fijo, lo cual rompe operación pequeña ($30/leg → fill_gate
+        # imposible). Ahora pide 30% del intended o $5, lo que sea mayor.
+        # Sobre $30/leg: gate = $9 (no $50).
+        # Sobre $1000/leg: gate = $300.
+        # Sobre $50/leg: gate = $15.
+        dynamic_min_fill = max(5.0, eff_usd * 0.30)
+
         bot_agent = BotAgent(
             node,
             indexer,
@@ -649,6 +689,8 @@ async def open_positions(
             hedge_ratio=cand["hedge_ratio"],
             trace_id=trace_id,
             intended_usd_per_trade=eff_usd,
+            expected_edge_usd=approx_spread_usd,   # 2026-05-26: needed for dynamic spread gate
+            min_m1_fill_usd=dynamic_min_fill,      # 2026-05-26: scales with eff_usd
         )
 
         bot_open_dict = await bot_agent.open_trades(wallet)

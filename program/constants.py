@@ -5,15 +5,21 @@ EXIT_CHECK_SECONDS = 30       # cada cuánto evalúas exits (segundos)
 KPI_SECONDS = 600             # cada cuánto mandas KPIs (10 min)
 SESSION_SUMMARY_SECONDS = 300 # cada cuánto mandas resumen de rentabilidad de sesión (5 min)
 BATCH_OPEN_TRADES = 3         # abrir N trades y luego forzar revisión
-MAX_OPEN_TRADES = 15          # hard cap de pares abiertos (era 8, subido para testing)
+MAX_OPEN_TRADES = 1           # 2026-05-26: bajado a 1 para operación $100 mainnet.
+                              # Con $100 equity y $30/leg = $60 notional combinado,
+                              # solo se puede sostener 1 par sin reventar el cap de margen.
+                              # Subir a 2-3 cuando equity llegue a $300+.
 
 # ===== Exit rules =====
 USE_MIN_PROFIT_TP = True
 # MIN_PROFIT_USD y MIN_PROFIT_PCT son el beneficio NETO mínimo DESPUÉS de fees.
 # La lógica calcula automáticamente fees pagadas en apertura + estimado de cierre
 # y los suma al umbral, así que estos valores son la "ganancia real mínima".
-MIN_PROFIT_PCT = 0.00025  # 0.025% del notional como ganancia neta mínima
-MIN_PROFIT_USD = 0.50     # o al menos $0.50 neto — lo que sea mayor
+# 2026-05-26: bajado a $0.10 para operación $100 mainnet.
+# Con notional combinado ~$60, MIN_PROFIT_PCT=0.0025 → $0.15 net mínimo.
+# Más bajo que esto significa cerrar trades por puro ruido.
+MIN_PROFIT_PCT = 0.0025   # 0.25% del notional como ganancia neta mínima
+MIN_PROFIT_USD = 0.10     # o al menos $0.10 neto — lo que sea mayor
 # Con $1000/leg ($2000 notional), fees round-trip ≈ $2.00:
 #   min_gross_required = fees + max($0.50, $2000×0.025%) = $2 + $0.50 = $2.50
 # Antes: MIN_PROFIT_PCT=0.15% → PCT gate=$3.00 → min_gross=$5.00
@@ -45,11 +51,13 @@ MIN_HOLD_MINUTES_FOR_TP = 0  # 0 = sin restricción de tiempo mínimo
 RISK_OFF_ENABLED = True
 
 # Disparadores de risk-off
-RISK_OFF_FREE_COLLATERAL_TRIGGER = 7000   # si free collateral < esto → risk-off
+RISK_OFF_FREE_COLLATERAL_TRIGGER = 25     # 2026-05-26: ajustado a operación $100.
+                                           # Si free collateral < $25, dispara risk-off (cierra peor par).
+                                           # Cuando equity crezca a $500+: subir a $100.
 
 # IMPORTANTE: igual a MAX_OPEN_TRADES. Si fuera menor, risk-off dispararía
 # antes de llegar al hard cap y cerraría posiciones sanas.
-RISK_OFF_FORCE_IF_OPEN_TRADES_GE = 15    # igualado a MAX_OPEN_TRADES
+RISK_OFF_FORCE_IF_OPEN_TRADES_GE = 1     # 2026-05-26: igualado a MAX_OPEN_TRADES=1
 
 # Edad mínima antes de que risk-off pueda cerrar un par.
 # 0.5h = 30 minutos. Protege aperturas muy recientes de cierres forzados inmediatos,
@@ -82,11 +90,18 @@ RISK_SCORE_W_UNREAL_PNL = 0.15  # $1 de pérdida ≈ 0.15 puntos de score
 # Previous: $35 floor → $550/leg pair could lose 3.2% before triggering.
 # Now: $20 floor → tighter protection on small positions, scales up on large ones.
 # Note: TP_LOSS_EXIT (new) cuts losing positions when z reverts BEFORE HARD_SL triggers.
-HARD_SL_USD = 20.0
-HARD_SL_PCT = 0.006
+# 2026-05-26: ajustado para operación $100 mainnet.
+# $3 USD = 3% del equity total = stop loss tolerable por trade individual.
+# Sobre $60 notional combinado: 3/60 = 5% → razonable.
+# Cuando subas a $500 equity: subir a $10. A $5,000: $20.
+HARD_SL_USD = 3.0
+HARD_SL_PCT = 0.05            # 5% del notional combinado
 
 # SELECT MODE
-MODE = "DEVELOPMENT"
+# 2026-05-26: cambiado a PRODUCTION para operar $100 USD en mainnet.
+# Esto cambia automáticamente: NODE/INDEXER/WEBSOCKET a mainnet,
+# MAX_ENTRY_SPREAD_BPS ceiling 500→75, y MAKER_EXIT_ENABLED a True.
+MODE = "PRODUCTION"
 
 # ===== Fee constants =====
 # Keep in sync with func_private.py TAKER_FEE_BPS.
@@ -129,14 +144,27 @@ MIN_EDGE_FEE_MULTIPLE = 2.0
 # Compute USD_PER_TRADE and MAX_OPEN_TRADES dynamically from equity each loop.
 # Prevents over/under-deployment as account grows or shrinks.
 # USD_PER_TRADE stays between DYNAMIC_SIZING_MIN_USD and DYNAMIC_SIZING_MAX_USD.
+#
+# 2026-05-26: AJUSTADO PARA OPERACIÓN $100 EN MAINNET.
+# Con $100 equity:
+#   30% × $100 = $30/leg
+#   max_open = floor(100 / (30 × 2.5)) = 1 pair
+#   Notional combinado = $60 (60% del equity, conservador para mainnet)
+# Cuando equity crezca a $500+:
+#   30% × $500 = $150/leg, max_open hasta 2 pairs
+#   (subir DYNAMIC_SIZING_PCT a 0.20 cuando equity > $300 para diversificar)
 DYNAMIC_SIZING = True
-DYNAMIC_SIZING_PCT = 0.04         # 4% of equity per leg
-                                  # With $13k equity: 4% = $520 → rounds to $500/leg
-                                  # 10 pairs × $500 × 2 = $10,000 gross (~0.77× equity)
-                                  # Previous: 2.5% → $350/leg → 14 pairs → 0.75× equity
-                                  # Now: slightly larger positions, fewer max pairs, same leverage
-DYNAMIC_SIZING_MIN_USD = 200.0    # floor: $200/leg
-DYNAMIC_SIZING_MAX_USD = 3000.0   # cap:   $3000/leg
+DYNAMIC_SIZING_PCT = 0.30         # 30% of equity per leg
+DYNAMIC_SIZING_MIN_USD = 20.0     # floor: $20/leg (límite práctico mainnet)
+DYNAMIC_SIZING_MAX_USD = 50.0     # cap:   $50/leg (limita tamaño hasta validar)
+# Cuando subas a $500 de equity y quieras escalar:
+#   DYNAMIC_SIZING_PCT = 0.20
+#   DYNAMIC_SIZING_MIN_USD = 50.0
+#   DYNAMIC_SIZING_MAX_USD = 500.0
+# Cuando subas a $5,000:
+#   DYNAMIC_SIZING_PCT = 0.08
+#   DYNAMIC_SIZING_MIN_USD = 200.0
+#   DYNAMIC_SIZING_MAX_USD = 3000.0
 # Max open trades = floor(equity / (usd_per_trade × 2.5)), hard-capped at MAX_OPEN_TRADES.
 # 2.5× buffer ensures initial margin + SL headroom for all open pairs simultaneously.
 # Example at $13k equity, $500/leg: floor(13000 / (500×2.5)) = floor(13000/1250) = 10 pairs
@@ -146,22 +174,58 @@ DYNAMIC_SIZING_MAX_USD = 3000.0   # cap:   $3000/leg
 # the equity measured at session start. Entries resume after DRAWDOWN_HALT_HOURS.
 # Only counts positions opened in the current session (uses unrealizedPnL delta).
 DRAWDOWN_CIRCUIT_BREAKER_ENABLED = True
-DRAWDOWN_CIRCUIT_BREAKER_PCT = 0.03   # halt if session loss exceeds 3% of start equity
+# 2026-05-26: subido de 3% a 20% para operación $100 mainnet.
+# A 3% sobre $100 = $3 → se dispararía con un solo trade malo.
+# A 20% sobre $100 = $20 → halt cuando pierdes una quinta parte del capital.
+# Cuando subas a $500+ equity: bajar a 5% ($25 halt).
+# Cuando subas a $5,000+: bajar a 3% original.
+DRAWDOWN_CIRCUIT_BREAKER_PCT = 0.20
 DRAWDOWN_HALT_HOURS = 4.0             # halt duration in hours
 
-# ===== Pre-COMMIT Liquidity Gate =====
-# Skip COMMIT if bid-ask spread on either leg exceeds this threshold.
-# Prevents fee waste from flattening when one leg fills but the other can't.
+# ===== Pre-COMMIT Spread Gate (DYNAMIC) =====
+# Replaces the fixed MAX_ENTRY_SPREAD_BPS. Decides whether the cost of crossing
+# the bid-ask spread of both legs (entry + exit) is acceptable RELATIVE to the
+# expected edge of the specific trade.
 #
-# Testnet (DEVELOPMENT): 200 bps — orderbooks are intentionally thin,
-#   spreads of 50-250 bps are normal and don't predict mainnet fill quality.
-#   Still blocks truly illiquid outliers (ATH-USD at 257 bps, etc.)
+# Math:
+#   spread_cost_usd = (spread_bps_leg1 + spread_bps_leg2) × notional_per_leg / 10000
+#       (this is the total cost of crossing both books on entry AND exit,
+#        derived from: 2 legs × 2 sides × half_spread × notional)
 #
-# Mainnet (PRODUCTION): 25 bps — liquid pairs have 1-20 bps.
-#   Anything wider predicts partial fills on one leg.
+#   Decision logic (3 phases, applied in order):
+#     1. FLOOR pass: if both legs have spread ≤ SPREAD_GATE_PER_LEG_FLOOR_BPS,
+#        permit unconditionally (the spread is so tight that even with tiny edge
+#        the cost is negligible).
+#     2. CEILING block: if any leg's spread > SPREAD_GATE_PER_LEG_CEILING_BPS,
+#        reject unconditionally regardless of edge (book is structurally broken
+#        — market maker pulled, news event, etc.).
+#     3. EDGE-PROPORTIONAL: spread_cost_usd ≤ SPREAD_GATE_MAX_PCT_OF_EDGE × expected_edge_usd.
+#        This is the dynamic core: allow proportionally bigger spreads for
+#        proportionally bigger expected edges.
 #
-# Set to 0 to disable entirely.
-MAX_ENTRY_SPREAD_BPS = 200 if MODE == "DEVELOPMENT" else 25
+# Example numbers (with default 0.30, floor=25, ceiling=500/75):
+#   Trade A: edge=$207, leg1=210bps, leg2=20bps, notional=$2,550
+#     phase 1: leg2 ≤ 25 ✓ but leg1 > 25 ✗ → not unconditional
+#     phase 2: leg1=210 ≤ 500 (testnet) ✓ → not blocked
+#     phase 3: cost = (210+20)×2550/10000 = $58.65;  max = 0.30×$207 = $62.10
+#              $58.65 ≤ $62.10 → PASS
+#   Trade B: edge=$207, leg1=417bps, leg2=20bps
+#     phase 3: cost = $111;  max = $62 → FAIL
+#   Trade C: edge=$80, leg1=15bps, leg2=10bps
+#     phase 1: both ≤ 25 → PASS (no edge calculation needed)
+#   Trade D: edge=$1000, leg1=600bps, leg2=10bps  (mainnet)
+#     phase 2: leg1 > 75 (mainnet ceiling) → FAIL (book is broken regardless of edge)
+SPREAD_GATE_MAX_PCT_OF_EDGE = 0.30      # spread cost ≤ 30% of expected edge
+SPREAD_GATE_PER_LEG_FLOOR_BPS = 25      # both legs below → always permit
+SPREAD_GATE_PER_LEG_CEILING_BPS = 500 if MODE == "DEVELOPMENT" else 75
+                                         # hard cap regardless of edge:
+                                         #   testnet 500 (thin books are normal here)
+                                         #   mainnet 75  (anything wider = broken book)
+
+# Backward-compat: kept as informational constant, NO longer used by the bot logic.
+# Pre-2026-05-26 the spread check used this fixed value. Replaced by the dynamic
+# gate above. Keep here only for legacy modules that might still import it.
+MAX_ENTRY_SPREAD_BPS = SPREAD_GATE_PER_LEG_CEILING_BPS
 
 # Close all open positions and orders
 # PELIGRO: True cierra TODO a market price en el startup — paga taker fees por cada posición
@@ -179,10 +243,10 @@ FIND_COINTEGRATED = False
 COINTEGRATION_REFRESH_HOURS = 6
 
 # Manage exits
-MANAGE_EXITS = True
+MANAGE_EXITS = False
 
 # Place Trades
-PLACE_TRADES = True
+PLACE_TRADES = False
 
 # Resolution
 RESOLUTION = "1HOUR"
@@ -193,9 +257,26 @@ WINDOW = 21
 # Thresholds - Opening
 MAX_HALF_LIFE = 24
                        # El exit por Z_SL y HARD_SL gestiona el riesgo de tardanza
-ZSCORE_THRESH = 3.0    # Backtested: z=3 → EV=$35/trade, WR=85%, PF=2.9 (vs z=2: EV=$12, WR=77%, PF=1.6)
-USD_PER_TRADE = 1000
-USD_MIN_COLLATERAL = 7000
+ZSCORE_THRESH = 2.7    # 2026-05-22: bajado de 3.0 a 2.7 tras backtest OOS comparativo.
+                       #
+                       # Backtest (60d, 70/30 split, top 30 pares, defaults de constants):
+                       #                     COMBINED                       OOS (últimos 18d)
+                       #   z   n   WR   PF   EV    Net      Sharpe  DD    oos_n WR    PF    EV     Net
+                       #   2.5 1378 73.3% 2.00 $7.84 $10,797 8.27   -$524  431  77.5% 3.81 $16.20 $6,980
+                       #   2.7 1179 74.1% 2.21 $9.15 $10,791 8.68   -$420  373  78.8% 3.85 $17.19 $6,412  ← elegido
+                       #   2.8 1083 73.8% 2.23 $9.39 $10,173 8.47   -$484  346  78.6% 3.87 $17.61 $6,094
+                       #   3.0 908  73.6% 2.25 $9.68 $8,786  7.70   -$561  302  77.8% 3.92 $17.49 $5,282
+                       #
+                       # z=2.7 domina en Pareto: mejor Net, WR, Sharpe y DD.
+                       # OOS es MEJOR que IS (no overfit; régimen reciente favorece mean-reversion).
+                       # Trade marginal entre 2.8→2.7 tiene EV=$11.78 (OOS), bien sobre costo round-trip.
+                       # Trade marginal entre 2.7→2.5 baja a EV=$9.79 con PF degradando — no vale el churn.
+                       # ZSCORE_THRESH anterior fijo en 3.0 capturaba solo 8% de escaneos vs ~20% con 2.7
+                       # (en log del bot 2026-05-19/22). 2.5× más oportunidades, mismo nivel de calidad.
+USD_PER_TRADE = 30           # 2026-05-26: fallback if dynamic sizing fails. $30/leg.
+USD_MIN_COLLATERAL = 30      # 2026-05-26: Bot puede operar hasta que collateral baje a $30.
+                              # Con $100 equity, deja $70 de buffer para variaciones.
+                              # Cuando subas equity a $500+: subir a $150.
 
 # Thresholds - Closing
 CLOSE_AT_ZSCORE_CROSS = True
@@ -221,7 +302,8 @@ SL_COOLDOWN_MIN_HOURS = 2.0          # mínimo 2h de cooldown tras SL
 SL_COOLDOWN_HALFLIFE_MULT = 0.75     # o 75% del half_life si es mayor
 
 # Wallet Address
-WALLET_ADDRESS = "dydx1napkzyjp3rauk5p787r9sfhvs74r8e357a30n5"
+#testnet: WALLET_ADDRESS = "dydx1napkzyjp3rauk5p787r9sfhvs74r8e357a30n5"
+WALLET_ADDRESS = "dydx1svqmveffvuan4p3w6r3kgc474hn07nqdrdue48"
 
 # WALLET PRIVATE KEY
 API_KEY = config("API_KEY")
@@ -232,9 +314,9 @@ INDEXER_TESTNET = "https://indexer.v4testnet.dydx.exchange"
 WEBSOCKET_TESTNET = "wss://indexer.v4testnet.dydx.exchange/v4/ws"
 
 # URL ADDRESS MAINNET
-NODE_MAINNET = ""
-INDEXER_MAINNET = ""
-WEBSOCKET_MAINNET = ""
+NODE_MAINNET = "dydx-ops-grpc.kingnodes.com"
+INDEXER_MAINNET = "https://indexer.dydx.trade/v4"
+WEBSOCKET_MAINNET = "wss://indexer.dydx.trade/v4/ws"
 
 # URL Selection
 NODE = NODE_MAINNET if MODE == "PRODUCTION" else NODE_TESTNET
@@ -287,10 +369,8 @@ MARKET_BLACKLIST = {
     "PENDLE-USD",   # tóxico: 5 pares en bottom-10, -$1,148 combinado (backtest 2026-05)
 }
 
-UNMANAGED_IGNORE_MARKETS = {
-    "LDO-USD", "COMP-USD", "STX-USD", "ARKM-USD",
-    # Posiciones atascadas por falta de liquidez en testnet (2026-05-19).
-    # No aplica en producción — los orderbooks de mainnet son profundos.
-    # Vaciar esta lista cuando se cierren manualmente desde la UI de dYdX.
-    "ATH-USD", "BLAST-USD", "OP-USD", "PUMP-USD", "ZK-USD", "ZORA-USD",
-}
+UNMANAGED_IGNORE_MARKETS = set()
+# 2026-05-26: vaciado al pasar a mainnet. Los 10 markets que estaban aquí eran
+# todos posiciones atascadas en testnet sin liquidez. En mainnet no aplica.
+# Si en mainnet aparece exposición que el bot no puede cerrar (raro), agregar
+# manualmente aquí.

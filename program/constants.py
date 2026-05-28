@@ -229,16 +229,23 @@ SPREAD_GATE_MAX_PCT_OF_EDGE = 0.50      # spread cost ≤ 50% of expected edge
                                          # captura neta positiva ajustada.
 SPREAD_GATE_PER_LEG_FLOOR_BPS = 25      # both legs below → always permit
 SPREAD_GATE_PER_LEG_CEILING_BPS = 500 if MODE == "DEVELOPMENT" else 250
-                                         # 2026-05-28: mainnet subido de 75 a 250.
-                                         # La realidad observada en dYdX mainnet:
-                                         #   - BTC/ETH/SOL: 3-15 bps (siempre pasan floor)
-                                         #   - Altcoin majors (AVAX, LINK, ETC): 80-200 bps
-                                         #   - Mid-cap (MANA, ENS, FIL): 100-400 bps
-                                         #   - Low-cap / new listings: 500-2000+ bps (broken)
-                                         # Ceiling 250 deja pasar majors y mid-caps razonables,
-                                         # bloquea low-caps con books rotos.
+                                         # 2026-05-28: mainnet 250 (data-driven).
+                                         # calibrate_spread_ceiling.py ejecutado en mainnet
+                                         # reveló distribución BIMODAL:
+                                         #   - Cohorte real (50%):   1.5 - 83 bps
+                                         #   - Borderline (16%):     83 - 250 bps
+                                         #   - Cohorte rota (34%):   1000 - 4000+ bps
+                                         # No hay markets entre 250-1000 bps. Ceiling 250
+                                         # acepta toda la cohorte real + borderline,
+                                         # bloquea estructuralmente los books rotos.
+                                         #
+                                         # Tight markets observados: ETH (1.5), SOL (2.4),
+                                         # XRP (5.4), LINK (14.3), LTC (23), DOT (24),
+                                         # ADA (25), APT (32), AVAX (38), UNI (34), SUI (34).
+                                         # Estos son los pares "viables" económicamente.
+                                         #
                                          #   testnet 500 (thin books normal aquí)
-                                         #   mainnet 250 (allow altcoins, block broken books)
+                                         #   mainnet 250 (real cohort, blocks broken books)
 
 # Backward-compat: kept as informational constant, NO longer used by the bot logic.
 # Pre-2026-05-26 the spread check used this fixed value. Replaced by the dynamic

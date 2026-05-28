@@ -221,12 +221,24 @@ DRAWDOWN_HALT_HOURS = 4.0             # halt duration in hours
 #     phase 1: both ≤ 25 → PASS (no edge calculation needed)
 #   Trade D: edge=$1000, leg1=600bps, leg2=10bps  (mainnet)
 #     phase 2: leg1 > 75 (mainnet ceiling) → FAIL (book is broken regardless of edge)
-SPREAD_GATE_MAX_PCT_OF_EDGE = 0.30      # spread cost ≤ 30% of expected edge
+SPREAD_GATE_MAX_PCT_OF_EDGE = 0.50      # spread cost ≤ 50% of expected edge
+                                         # 2026-05-28: subido de 0.30 a 0.50.
+                                         # Mainnet altcoins (AVAX, ETC, LINK, etc.) tienen
+                                         # spreads 80-200bps reales. Con 0.30 y $30/leg, casi
+                                         # todo edge se va en spread cost. 0.50 permite
+                                         # captura neta positiva ajustada.
 SPREAD_GATE_PER_LEG_FLOOR_BPS = 25      # both legs below → always permit
-SPREAD_GATE_PER_LEG_CEILING_BPS = 500 if MODE == "DEVELOPMENT" else 75
-                                         # hard cap regardless of edge:
-                                         #   testnet 500 (thin books are normal here)
-                                         #   mainnet 75  (anything wider = broken book)
+SPREAD_GATE_PER_LEG_CEILING_BPS = 500 if MODE == "DEVELOPMENT" else 250
+                                         # 2026-05-28: mainnet subido de 75 a 250.
+                                         # La realidad observada en dYdX mainnet:
+                                         #   - BTC/ETH/SOL: 3-15 bps (siempre pasan floor)
+                                         #   - Altcoin majors (AVAX, LINK, ETC): 80-200 bps
+                                         #   - Mid-cap (MANA, ENS, FIL): 100-400 bps
+                                         #   - Low-cap / new listings: 500-2000+ bps (broken)
+                                         # Ceiling 250 deja pasar majors y mid-caps razonables,
+                                         # bloquea low-caps con books rotos.
+                                         #   testnet 500 (thin books normal aquí)
+                                         #   mainnet 250 (allow altcoins, block broken books)
 
 # Backward-compat: kept as informational constant, NO longer used by the bot logic.
 # Pre-2026-05-26 the spread check used this fixed value. Replaced by the dynamic

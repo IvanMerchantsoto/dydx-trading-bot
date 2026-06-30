@@ -540,6 +540,73 @@ async def manage_trade_exits(node, indexer, wallet):
                     f"| pnl_gross={pnl_gross:.2f} | net_est={net_pnl_est:.2f}"
                 )
 
+        # ── 2b. ZERO-CROSSING TP (2026-06-30 fix) ───────────────────────────
+        # Si z cruzó la media (cambio de signo vs entry), la tesis de
+        # mean-reversion se cumplió COMPLETAMENTE — el spread no solo volvió
+        # a la media, sino que la atravesó al otro lado.
+        #
+        # Esto es una señal MÁS FUERTE que |z|<=Z_TP y debe disparar TP
+        # inmediatamente, SIN esperar TP_CONFIRM_CHECKS, porque:
+        #   1. Es matemáticamente más informativo (cruce real de mean)
+        #   2. Captura casos donde el spread "salta" la zona TP entre 2 muestras
+        #
+        # Caso real (LDO/POL 2026-06-30): entry z=+2.9447. Muestreos: +0.91 →
+        # -1.78 en consecutivos de 30s. El bot NUNCA midió |z|<=0.7 porque
+        # el z atravesó la zona TP entre 2 samples. Resultado: trade no
+        # cerró a tiempo, riesgo de perder ~$1.43 de profit acumulado.
+        #
+        # Con este fix, el primer sample con z negativo (z_now=-1.78 vs
+        # z_entry=+2.94) dispara TP_CROSSED_ZERO inmediatamente.
+        #
+        # Threshold de ±0.1 evita disparar por ruido cerca de z=0 cuando
+        # el spread oscila justo en la media.
+        if (not is_close) and USE_Z_TP and (z_now is not None):
+            zero_crossed = (
+                (z_entry >  0.1 and z_now < -0.1) or
+                (z_entry < -0.1 and z_now >  0.1)
+            )
+            if zero_crossed:
+                if can_pnl and pnl_gross > 0 and ok_profit:
+                    is_close = True
+                    close_reason = (
+                        f"TP_CROSSED_ZERO: z_entry={z_entry:.3f} → z_now={z_now:.3f} "
+                        f"(spread overshot mean) "
+                        f"| pnl_gross={pnl_gross:.2f} | net_est={net_pnl_est:.2f} "
+                        f"| min_gross={min_gross_required:.2f}"
+                    )
+                    log_event({
+                        "type": "tp_zero_crossing_trigger",
+                        "trace_id": trace_id,
+                        "m1": m1, "m2": m2,
+                        "z_entry": round(z_entry, 4),
+                        "z_now": round(z_now, 4),
+                        "pnl_gross": round(pnl_gross, 4),
+                        "net_est": round(net_pnl_est, 4),
+                    })
+                elif can_pnl and pnl_gross > 0 and not ok_profit:
+                    # Cruzó pero profit aún no cubre fees + min — esperar más
+                    log_event({
+                        "type": "tp_zero_crossing_blocked_profit",
+                        "trace_id": trace_id,
+                        "m1": m1, "m2": m2,
+                        "z_entry": round(z_entry, 4),
+                        "z_now": round(z_now, 4),
+                        "pnl_gross": round(pnl_gross, 4),
+                        "net_est": round(net_pnl_est, 4),
+                        "min_required": round(min_gross_required, 4),
+                    }, print_terminal=False)
+                elif can_pnl and pnl_gross <= 0:
+                    # Cruzó pero estamos en pérdida (raro pero posible si fees>>profit)
+                    # Mantener: HARD_SL/Z_SL eventualmente lo cerrarán
+                    log_event({
+                        "type": "tp_zero_crossing_blocked_loss",
+                        "trace_id": trace_id,
+                        "m1": m1, "m2": m2,
+                        "z_entry": round(z_entry, 4),
+                        "z_now": round(z_now, 4),
+                        "pnl_gross": round(pnl_gross, 4),
+                    }, print_terminal=False)
+
         # ── 3. Take-Profit (z reversion + confirmation + fee gate) ──────────
         # Trailing TP: sigue el spread hasta su peak y cierra en el pullback.
         # Estándar: cierra cuando |z| ≤ Z_TP (umbral fijo).

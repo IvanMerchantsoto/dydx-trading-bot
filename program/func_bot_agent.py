@@ -64,7 +64,12 @@ class BotAgent:
         intended_usd_per_trade=None,
         expected_edge_usd=0.0,       # 2026-05-26: needed for dynamic spread gate
         prepare_price_bps=2000,      # 20% lejos del oracle para no ejecutar
-        prepare_good_til_blocks=2,   # expira solo, no depende de cancel
+        # 2026-06-30: 2 → 10. Con 2 blocks (~3s) las txs llegaban al chain
+        # demasiado tarde y eran rechazadas code=10 "GoodTilBlock < blockHeight".
+        # Con 10 (~14s) tenemos margen para latencia y aún expiran rápido
+        # antes de cualquier movimiento de mercado. POST_ONLY a 20% del oracle
+        # nunca debería ejecutar de todas formas.
+        prepare_good_til_blocks=10,
         prepare_visible_timeout_s=6.0,
         audit_retries=20,   # 2026-06-01: 5 → 20 (~60s window vs ~8s)
     ):

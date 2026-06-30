@@ -226,7 +226,13 @@ async def place_market_order(
             price=execution_price,
             time_in_force=time_in_force_type,
             reduce_only=bool(reduce_only),
-            good_til_block=current_block + 20,
+            # 2026-06-30: GoodTilBlock buffer subido de 20 → 40 (~56s a 1.4s/blk).
+            # Log mostró 276 broadcasts rechazados code=10 "GoodTilBlock < current
+            # blockHeight" — 30+ segundos pasan entre node.latest_block_height()
+            # y la llegada al chain. Con buffer 20 (~28s), apenas no alcanzaba.
+            # Con 40 (~56s), tenemos colchón para latencia de mempool / gRPC.
+            # MAX permitido por dYdX para SHORT_TERM = 50.
+            good_til_block=current_block + 40,
         )
 
         log_event({

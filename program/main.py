@@ -88,8 +88,14 @@ def _compute_dynamic_sizing(equity: float) -> tuple:
     _round_step = max(5.0, float(DYNAMIC_SIZING_MAX_USD) / 10.0)
     usd_per_trade = max(float(DYNAMIC_SIZING_MIN_USD), round(clamped / _round_step) * _round_step)
 
-    # Max open trades bounded by margin headroom (2.5× per pair)
-    per_pair_requirement = usd_per_trade * 2.5
+    # Max open trades bounded by margin headroom.
+    # 2026-06-30: multiplicador 2.5 → 1.0. Con cross-margin 5x en dYdX,
+    # un pair de $30/leg requiere solo ~$12 de margin real. El 2.5 (=$75/pair)
+    # era para spot/isolated SIN leverage. Con cross, $30/pair de buffer
+    # (≈3x el margin real) deja amplio colchón para drawdown.
+    # Resultado: con $99 equity → dynamic_max = int($99/$30) = 3 pares.
+    # Con $200 equity → 6 pares (todavía con buffer sano).
+    per_pair_requirement = usd_per_trade * 1.0
     dynamic_max = int(equity / per_pair_requirement) if per_pair_requirement > 0 else MAX_OPEN_TRADES
 
     # Floor of 1 (not 3): allow tiny accounts to still trade at least 1 pair.

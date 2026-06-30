@@ -5,10 +5,14 @@ EXIT_CHECK_SECONDS = 30       # cada cuánto evalúas exits (segundos)
 KPI_SECONDS = 600             # cada cuánto mandas KPIs (10 min)
 SESSION_SUMMARY_SECONDS = 300 # cada cuánto mandas resumen de rentabilidad de sesión (5 min)
 BATCH_OPEN_TRADES = 3         # abrir N trades y luego forzar revisión
-MAX_OPEN_TRADES = 1           # 2026-05-26: bajado a 1 para operación $100 mainnet.
-                              # Con $100 equity y $30/leg = $60 notional combinado,
-                              # solo se puede sostener 1 par sin reventar el cap de margen.
-                              # Subir a 2-3 cuando equity llegue a $300+.
+MAX_OPEN_TRADES = 3           # 2026-06-30: subido de 1 a 3.
+                              # Razón: con cross-margin 5x en dYdX, $30/leg requiere
+                              # solo $6 de margin. 3 pares × $12 margin = $36 < $87 free.
+                              # Buffer suficiente para drawdown de hasta -$48 sin tocar
+                              # el min_collateral gate ($30).
+                              # IMPORTANTE: también hay que ajustar el multiplicador
+                              # dinámico en main.py _compute_dynamic_sizing (2.5 → 1.0)
+                              # para que dynamic_max no nos limite por error.
 
 # ===== Exit rules =====
 USE_MIN_PROFIT_TP = True

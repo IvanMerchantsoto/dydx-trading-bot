@@ -72,22 +72,29 @@ def _compute_dynamic_sizing(equity: float) -> tuple:
     """
     Compute (usd_per_trade, max_open_trades) from current equity.
 
-    usd_per_trade   = clamp(equity × DYNAMIC_SIZING_PCT, MIN, MAX), rounded to $50
-    max_open_trades = floor(equity / (usd_per_trade × 2.5)), capped at MAX_OPEN_TRADES
-                      2.5× buffer ensures initial margin + SL headroom for all pairs.
+    2026-05-26: refactored for small-account operation ($100 mainnet test).
+    - Rounding granularity scales with DYNAMIC_SIZING_MAX_USD (was fixed /50)
+    - max_open floor of 1, not 3 (previous hardcoded 3 forced over-leverage)
     """
     if equity <= 0:
         return float(USD_PER_TRADE), int(MAX_OPEN_TRADES)
 
     raw = equity * float(DYNAMIC_SIZING_PCT)
     clamped = max(float(DYNAMIC_SIZING_MIN_USD), min(float(DYNAMIC_SIZING_MAX_USD), raw))
-    # Round to nearest $50 for clean sizing
-    usd_per_trade = max(float(DYNAMIC_SIZING_MIN_USD), round(clamped / 50.0) * 50.0)
 
-    # Max open trades bounded by capital buffer
+    # Adaptive rounding: 10% of MAX cap, minimum $5 step.
+    # With MAX=$50 → step=$5. With MAX=$3000 → step=$300.
+    # Prevents $29 from getting rounded up to $50 in small accounts.
+    _round_step = max(5.0, float(DYNAMIC_SIZING_MAX_USD) / 10.0)
+    usd_per_trade = max(float(DYNAMIC_SIZING_MIN_USD), round(clamped / _round_step) * _round_step)
+
+    # Max open trades bounded by margin headroom (2.5× per pair)
     per_pair_requirement = usd_per_trade * 2.5
     dynamic_max = int(equity / per_pair_requirement) if per_pair_requirement > 0 else MAX_OPEN_TRADES
-    max_open = max(3, min(int(MAX_OPEN_TRADES), dynamic_max))
+
+    # Floor of 1 (not 3): allow tiny accounts to still trade at least 1 pair.
+    # Cap at the configured MAX_OPEN_TRADES.
+    max_open = max(1, min(int(MAX_OPEN_TRADES), dynamic_max))
 
     return usd_per_trade, max_open
 

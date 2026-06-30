@@ -139,15 +139,57 @@ async def get_candles_historical(indexer, market):
 
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Spread (bid-ask BPS) cache — 2026-06-01
+# ─────────────────────────────────────────────────────────────────────────────
+# get_market_spread_bps is called in entry_pairs Phase 1 for EVERY pair (top
+# 150) on EVERY scan. That's 150 orderbook API calls per scan, the dominant
+# bottleneck (~30s/scan).
+#
+# Spreads on dYdX move slowly enough that a 60s TTL is acceptable for SCORING.
+# This is NOT used by the spread_check gate (which still fetches live in
+# func_bot_agent), so caching here doesn't compromise risk control.
+#
+# Impact: ~30s/scan → ~3-5s/scan on warm cache.
+_SPREAD_CACHE = {}              # market → (spread_bps, fetch_ts)
+_SPREAD_CACHE_TTL_S = 60        # 60 seconds — spreads change slowly enough
+
+
+def spread_cache_stats():
+    """Diagnostic helper — size & oldest age."""
+    now = time.time()
+    if not _SPREAD_CACHE:
+        return {"size": 0, "oldest_age_s": 0}
+    oldest = min(ts for _, ts in _SPREAD_CACHE.values())
+    return {"size": len(_SPREAD_CACHE), "oldest_age_s": int(now - oldest)}
+
+
+def spread_cache_clear():
+    _SPREAD_CACHE.clear()
+
+
 # Get bid-ask spread in basis points for a single market
-async def get_market_spread_bps(indexer, market):
+async def get_market_spread_bps(indexer, market, *, force_fresh: bool = False):
     """
     Fetches the best bid and ask from the live orderbook and returns the
     spread expressed in basis points: (ask - bid) / mid * 10_000.
 
     Returns None on any error so the caller can treat it as "proceed".
     A None result must never block a trade — it just means data unavailable.
+
+    Cached for _SPREAD_CACHE_TTL_S seconds. Pass force_fresh=True from any
+    code path that uses the value to MAKE a trading decision (e.g. the
+    pre-commit gate in func_bot_agent). Scoring callers (entry_pairs Phase 1)
+    should let the cache hit.
     """
+    now = time.time()
+    if not force_fresh:
+        cached = _SPREAD_CACHE.get(market)
+        if cached is not None:
+            sp, ts = cached
+            if now - ts < _SPREAD_CACHE_TTL_S:
+                return sp
+
     try:
         ob = await indexer.markets.get_perpetual_market_orderbook(market=market)
         asks = ob.get("asks", []) if isinstance(ob, dict) else []
@@ -159,7 +201,9 @@ async def get_market_spread_bps(indexer, market):
         if best_ask <= 0 or best_bid <= 0 or best_bid >= best_ask:
             return None
         mid = (best_ask + best_bid) / 2.0
-        return ((best_ask - best_bid) / mid) * 10_000.0
+        bps = ((best_ask - best_bid) / mid) * 10_000.0
+        _SPREAD_CACHE[market] = (bps, now)
+        return bps
     except Exception:
         return None
 

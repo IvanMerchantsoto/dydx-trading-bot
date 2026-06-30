@@ -45,6 +45,37 @@ def _to_dydx_side(side: str):
     return Order.Side.SIDE_SELL
 
 
+def _extract_tx_result(tx):
+    """
+    2026-06-02: Helper to extract chain rejection info from the tx response.
+
+    dydx-v4-client's node.place_order returns an object whose shape varies
+    by version. We try multiple attribute names because Cosmos SDK wraps
+    the response as either tx, tx_response, or BroadcastTxResponse.
+
+    Returns (tx_hash:str|None, tx_code:int|None, raw_log:str|None).
+    code == 0 → broadcast accepted (still may fail at execution)
+    code != 0 → broadcast rejected (sequence mismatch, fees, signature, etc.)
+    """
+    if tx is None:
+        return None, None, "tx_is_None"
+
+    # Direct attributes
+    tx_hash = getattr(tx, "tx_hash", None) or getattr(tx, "txhash", None)
+    tx_code = getattr(tx, "code", None)
+    raw_log = getattr(tx, "raw_log", None)
+
+    # Some clients wrap result in tx_response
+    if hasattr(tx, "tx_response"):
+        tr = tx.tx_response
+        tx_hash = tx_hash or getattr(tr, "txhash", None) or getattr(tr, "tx_hash", None)
+        if tx_code is None:
+            tx_code = getattr(tr, "code", None)
+        raw_log = raw_log or getattr(tr, "raw_log", None)
+
+    return tx_hash, tx_code, raw_log
+
+
 async def _get_market_obj_and_oracle(indexer, market: str):
     m_data = await indexer.markets.get_perpetual_markets(market)
     market_data = m_data["markets"][market]
@@ -209,11 +240,47 @@ async def place_market_order(
         }, print_terminal=False)
 
         tx = await node.place_order(wallet=wallet, order=placed_order)
+
+        # 2026-06-02: extraer y loguear el resultado de chain (code + raw_log)
+        tx_hash, tx_code, raw_log = _extract_tx_result(tx)
+        broadcast_ok = (tx_code is None or tx_code == 0)
+        log_event({
+            "type": "tx_broadcast_result",
+            "stage": "market",
+            "market": market,
+            "client_id": str(client_id),
+            "tx_hash": str(tx_hash) if tx_hash else None,
+            "tx_code": tx_code,
+            "raw_log": (str(raw_log)[:300] if raw_log else None),
+            "broadcast_ok": broadcast_ok,
+        }, print_terminal=False)
+
+        if not broadcast_ok:
+            # Chain rechazó la tx. NO incrementar sequence — la tx no consumió nonce.
+            print(f"[MARKET] ⚠️ Chain rechazó {market} cid={client_id} "
+                  f"code={tx_code} log={str(raw_log)[:120]}", flush=True)
+            log_event({
+                "type": "order_chain_rejected",
+                "stage": "market",
+                "market": market,
+                "client_id": str(client_id),
+                "tx_code": tx_code,
+                "raw_log": (str(raw_log)[:500] if raw_log else None),
+            })
+            return {
+                "order": {"id": str(client_id), "status": "REJECTED", "market": market},
+                "tx_hash": str(tx_hash) if tx_hash else "unknown",
+                "tx_code": tx_code,
+                "rejected": True,
+            }
+
         wallet.sequence += 1
 
         return {
             "order": {"id": str(client_id), "status": "PENDING", "market": market},
-            "tx_hash": getattr(tx, "tx_hash", "unknown"),
+            "tx_hash": str(tx_hash) if tx_hash else "unknown",
+            "tx_code": tx_code,
+            "rejected": False,
         }
 
     except Exception as e:
@@ -285,11 +352,44 @@ async def place_limit_order(
         }, print_terminal=False)
 
         tx = await node.place_order(wallet=wallet, order=placed_order)
+
+        # 2026-06-02: extraer y loguear chain rejection (igual que market)
+        tx_hash, tx_code, raw_log = _extract_tx_result(tx)
+        broadcast_ok = (tx_code is None or tx_code == 0)
+        log_event({
+            "type": "tx_broadcast_result",
+            "stage": "limit",
+            "market": market,
+            "client_id": str(client_id),
+            "tx_hash": str(tx_hash) if tx_hash else None,
+            "tx_code": tx_code,
+            "raw_log": (str(raw_log)[:300] if raw_log else None),
+            "broadcast_ok": broadcast_ok,
+        }, print_terminal=False)
+
+        if not broadcast_ok:
+            print(f"[LIMIT] ⚠️ Chain rechazó {market} cid={client_id} "
+                  f"code={tx_code} log={str(raw_log)[:120]}", flush=True)
+            log_event({
+                "type": "order_chain_rejected",
+                "stage": "limit",
+                "market": market,
+                "client_id": str(client_id),
+                "tx_code": tx_code,
+                "raw_log": (str(raw_log)[:500] if raw_log else None),
+            })
+            return {
+                "order": {"id": str(client_id), "status": "REJECTED", "market": market},
+                "tx_hash": str(tx_hash) if tx_hash else "unknown",
+                "tx_code": tx_code,
+                "rejected": True,
+            }
+
         wallet.sequence += 1
 
         return {
             "order": {"id": str(client_id), "status": "PENDING", "market": market},
-            "tx_hash": getattr(tx, "tx_hash", "unknown"),
+            "tx_hash": str(tx_hash) if tx_hash else "unknown",
         }
 
     except Exception as e:

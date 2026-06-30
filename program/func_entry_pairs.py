@@ -46,6 +46,24 @@ PAIR_FAIL_RESET_ON_SUCCESS = True   # resetear contador si hay LIVE
 # en ambos a la vez. Riesgo monitoreado via HARD_SL_USD por par.
 MAX_TRADES_PER_MARKET = 2
 
+# ── Runtime NaN cache (2026-06-02) ────────────────────────────────────────────
+# Pairs cuyo z-score devolvió NaN se acumulan aquí. El pre-filter del CSV los
+# salta en scans subsecuentes. Persiste durante la vida del proceso; se limpia
+# en cada regeneración del CSV (FIND_COINTEGRATED=True) o restart del bot.
+# Causa típica: market recién listado sin candles suficientes para regresión.
+# Key format: "BASE-USD|QUOTE-USD" (mismo orden que el CSV).
+_RUNTIME_NAN_PAIRS: set = set()
+
+
+def runtime_nan_pairs_stats():
+    """Diagnostic helper."""
+    return {"size": len(_RUNTIME_NAN_PAIRS), "sample": list(_RUNTIME_NAN_PAIRS)[:10]}
+
+
+def runtime_nan_pairs_clear():
+    """Call this from main loop after CSV regeneration."""
+    _RUNTIME_NAN_PAIRS.clear()
+
 
 def _pair_key(m1, m2):
     return "/".join(sorted([str(m1), str(m2)]))
@@ -202,6 +220,18 @@ async def open_positions(
     max_open_trades_override : int or None
         Override MAX_OPEN_TRADES (used for dynamic sizing from main.py).
     """
+    import time as _time
+    _scan_t0 = _time.time()
+    _phase_t = {"setup": 0.0, "csv_load": 0.0, "markets": 0.0, "funding": 0.0,
+                "prefilter": 0.0, "phase1": 0.0, "phase2": 0.0}
+    _phase_last = _scan_t0
+
+    def _mark(phase):
+        nonlocal _phase_last
+        _now = _time.time()
+        _phase_t[phase] = _phase_t.get(phase, 0.0) + (_now - _phase_last)
+        _phase_last = _now
+
     opened_count = 0
 
     # Effective parameters (may be overridden by dynamic sizing from main.py)
@@ -222,7 +252,10 @@ async def open_positions(
         sub = await _get_subaccount(indexer)
         free_collateral = _sf(sub.get("freeCollateral"))
         # Min collateral scales with trade size: at least 3 trade legs' worth
-        min_coll = max(float(USD_MIN_COLLATERAL), eff_usd * 3.0)
+        # 2026-05-26: bajado de 3.0 a 1.5. Con $30/leg, eff_usd × 3 = $90 (casi todo
+        # equity), bloqueando trades. eff_usd × 1.5 = $45 (50% del equity), permite
+        # operar manteniendo buffer de margen.
+        min_coll = max(float(USD_MIN_COLLATERAL), eff_usd * 1.5)
         if free_collateral and free_collateral < min_coll:
             print(f"[ENTRY] Free collateral ${free_collateral:,.2f} < min ${min_coll:,.2f}.")
             log_event({
@@ -242,6 +275,7 @@ async def open_positions(
         print(f"[ENTRY] cointegrated_pairs.csv not found. Run FIND_COINTEGRATED=True first.")
         return 0
     df = pd.read_csv(COINT_CSV_PATH)
+    _mark("setup")
 
     # ── 4b. Filter to top-N pairs by quality score (2026-05-26) ────────────
     # Mainnet has 449+ cointegrated pairs. Scanning all of them takes 18 min
@@ -280,9 +314,11 @@ async def open_positions(
             "actual_kept": len(df),
         }, print_terminal=False)
 
+    _mark("csv_load")
     # ── 5. Market metadata (one API call) ─────────────────────────────────
     markets_response = await indexer.markets.get_perpetual_markets()
     markets = markets_response.get("markets", {}) or {}
+    _mark("markets")
 
     # ── 6. Fetch funding rates upfront (one API call for all markets) ──────
     funding_rates = {}
@@ -315,6 +351,65 @@ async def open_positions(
     # cual es correcto: ahí el min order size de dYdX hace imposible operar.
     # La protección real contra pares espurios sigue siendo HEDGE_RATIO_LOG_MAX.
     MAX_PRICE_RATIO = 200.0
+
+    # ──────────────────────────────────────────────────────────────────────
+    # 7b. PRE-FILTER del CSV (2026-06-02)
+    # ──────────────────────────────────────────────────────────────────────
+    # Análisis del log de 4 días (1012 scans) mostró que 54 pares estaban
+    # SIEMPRE bloqueados por price_ratio (31,258 skips) y 41 pares SIEMPRE
+    # devolvían z=NaN (24,151 skips). Cada uno consume:
+    #   - 2 fetches de candles (cache hit, pero aún CPU)
+    #   - cálculo de z-score
+    #   - log_event(signal_skip)
+    # Total: ~55K events de ruido en 4 días, ~5-10% del tiempo de scan.
+    #
+    # Filtramos UNA SOLA VEZ al inicio del scan:
+    #   - Pares con price_ratio > MAX_PRICE_RATIO en este momento → fuera
+    #   - Pares que históricamente devolvieron NaN (_RUNTIME_NAN_PAIRS) → fuera
+    #
+    # _RUNTIME_NAN_PAIRS es module-level, se llena durante el scan cuando
+    # detectamos z=NaN, y persiste mientras el proceso vive. Se limpia en
+    # cada reload del CSV (cuando FIND_COINTEGRATED regenera).
+    _prefilter_dropped_price_ratio = 0
+    _prefilter_dropped_nan         = 0
+    _prefilter_dropped_no_market   = 0
+    _df_filtered_rows = []
+    for _, _row in df.iterrows():
+        _b = _row["base_market"]
+        _q = _row["quote_market"]
+        _pair_key = f"{_b}|{_q}"
+        if _pair_key in _RUNTIME_NAN_PAIRS:
+            _prefilter_dropped_nan += 1
+            continue
+        if _b not in markets or _q not in markets:
+            _prefilter_dropped_no_market += 1
+            continue
+        try:
+            _bp = float(markets[_b]["oraclePrice"])
+            _qp = float(markets[_q]["oraclePrice"])
+            _ratio = max(_bp, _qp) / max(1e-12, min(_bp, _qp))
+            if _ratio > MAX_PRICE_RATIO:
+                _prefilter_dropped_price_ratio += 1
+                continue
+        except Exception:
+            _prefilter_dropped_no_market += 1
+            continue
+        _df_filtered_rows.append(_row)
+    if _df_filtered_rows:
+        df = pd.DataFrame(_df_filtered_rows).reset_index(drop=True)
+    else:
+        df = df.iloc[0:0]   # empty but preserves columns
+
+    log_event({
+        "type": "csv_prefiltered",
+        "csv_after_prefilter": len(df),
+        "dropped_price_ratio": _prefilter_dropped_price_ratio,
+        "dropped_nan_runtime": _prefilter_dropped_nan,
+        "dropped_no_market": _prefilter_dropped_no_market,
+        "runtime_nan_set_size": len(_RUNTIME_NAN_PAIRS),
+    }, print_terminal=False)
+    _mark("funding")  # funding is reflected here pre-prefilter; prefilter is fast
+    _mark("prefilter")
 
     # ══════════════════════════════════════════════════════════════════════
     # PHASE 1: Collect and score all candidates
@@ -434,12 +529,15 @@ async def open_positions(
         # and over for the same pair, wasting scan cycles.
         if not math.isfinite(z_score):
             _skip_candles += 1
+            # 2026-06-02: añadir a runtime cache para skip futuro en pre-filter
+            _RUNTIME_NAN_PAIRS.add(f"{base_market}|{quote_market}")
             log_event({
                 "type": "signal_skip",
                 "reason": "zscore_not_finite",
                 "base": base_market,
                 "quote": quote_market,
                 "z_score": "nan" if math.isnan(z_score) else "inf",
+                "runtime_nan_set_now": len(_RUNTIME_NAN_PAIRS),
             }, print_terminal=False)
             continue
 
@@ -592,6 +690,7 @@ async def open_positions(
         ],
     })
 
+    _mark("phase1")
     # ══════════════════════════════════════════════════════════════════════
     # PHASE 2: Open top N candidates (with funding + min-edge gates)
     # ══════════════════════════════════════════════════════════════════════
@@ -857,5 +956,22 @@ async def open_positions(
     print("[ENTRY] Entry scan completed.")
     if opened_count > 0:
         print(f"[ENTRY] {opened_count} new pairs opened this batch.")
+
+    # 2026-06-02: emit scan_timing para audit_run.py
+    _mark("phase2")
+    _scan_total_s = _time.time() - _scan_t0
+    log_event({
+        "type": "scan_timing",
+        "scan_total_s": round(_scan_total_s, 3),
+        "phase_setup_s":     round(_phase_t.get("setup", 0), 3),
+        "phase_csv_load_s":  round(_phase_t.get("csv_load", 0), 3),
+        "phase_markets_s":   round(_phase_t.get("markets", 0), 3),
+        "phase_funding_s":   round(_phase_t.get("funding", 0), 3),
+        "phase_prefilter_s": round(_phase_t.get("prefilter", 0), 3),
+        "phase_phase1_s":    round(_phase_t.get("phase1", 0), 3),
+        "phase_phase2_s":    round(_phase_t.get("phase2", 0), 3),
+        "candidates": len(candidates) if 'candidates' in locals() else 0,
+        "opened": opened_count,
+    }, print_terminal=False)
 
     return opened_count

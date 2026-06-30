@@ -1,0 +1,18 @@
+from v4_proto.gogoproto import gogo_pb2 as _gogo_pb2
+from v4_proto.dydxprotocol.feetiers import params_pb2 as _params_pb2
+from v4_proto.dydxprotocol.feetiers import staking_tier_pb2 as _staking_tier_pb2
+from google.protobuf.internal import containers as _containers
+from google.protobuf import descriptor as _descriptor
+from google.protobuf import message as _message
+from collections.abc import Iterable as _Iterable, Mapping as _Mapping
+from typing import ClassVar as _ClassVar, Optional as _Optional, Union as _Union
+
+DESCRIPTOR: _descriptor.FileDescriptor
+
+class GenesisState(_message.Message):
+    __slots__ = ("params", "staking_tiers")
+    PARAMS_FIELD_NUMBER: _ClassVar[int]
+    STAKING_TIERS_FIELD_NUMBER: _ClassVar[int]
+    params: _params_pb2.PerpetualFeeParams
+    staking_tiers: _containers.RepeatedCompositeFieldContainer[_staking_tier_pb2.StakingTier]
+    def __init__(self, params: _Optional[_Union[_params_pb2.PerpetualFeeParams, _Mapping]] = ..., staking_tiers: _Optional[_Iterable[_Union[_staking_tier_pb2.StakingTier, _Mapping]]] = ...) -> None: ...

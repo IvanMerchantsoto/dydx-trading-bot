@@ -66,7 +66,7 @@ class BotAgent:
         prepare_price_bps=2000,      # 20% lejos del oracle para no ejecutar
         prepare_good_til_blocks=2,   # expira solo, no depende de cancel
         prepare_visible_timeout_s=6.0,
-        audit_retries=5,
+        audit_retries=20,   # 2026-06-01: 5 → 20 (~60s window vs ~8s)
     ):
         self.node = client_node
         self.indexer = client_indexer
@@ -154,11 +154,20 @@ class BotAgent:
         return float(oracle_price * mult)
 
     async def audit_with_retry(self, market: str, client_id: str, retries=None):
+        # 2026-06-01: ampliado de 5 retries / ~8s total a 20 retries / ~60s total.
+        # Razón: en logs mainnet, 100% de los audits regresan NOT_FOUND con la
+        # ventana corta. Hipótesis: indexer puede tardar 10-30s en propagar
+        # un fill (mucho más que la 1-2s típica de testnet). El presupuesto
+        # extendido permite distinguir entre:
+        #   - lag real del indexer (fill aparece en segundos 10-30) → captado
+        #   - orden rechazada en chain (nunca aparece) → real NOT_FOUND
+        # Costo: ~60s de espera worst-case por entry attempt (1 attempt cada ~3 min
+        # con cap=1, así que es asumible).
         retries = self.audit_retries if retries is None else int(retries)
 
         last = None
-        base_delay = 0.35
-        max_delay = 3.0
+        base_delay = 0.6     # antes 0.35 → primer poll un poco mas tardío
+        max_delay = 5.0      # antes 3.0  → polls 5,5,5,5,... una vez en el cap
 
         for i in range(retries):
             last = await get_real_fill_details(self.indexer, client_id, market)

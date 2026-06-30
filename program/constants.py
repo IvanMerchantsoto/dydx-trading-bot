@@ -353,7 +353,17 @@ WEBSOCKET_TESTNET = "wss://indexer.v4testnet.dydx.exchange/v4/ws"
 # URL ADDRESS MAINNET
 # 2026-05-26: INDEXER sin /v4 al final — la librería dydx-v4-client lo agrega
 # automáticamente. Si pones /v4 aquí, queda /v4/v4/... y devuelve 404.
-NODE_MAINNET = "dydx-ops-grpc.kingnodes.com"
+#
+# 2026-06-01: NODE cambiado de "dydx-ops-grpc.kingnodes.com" a
+# "dydx-grpc.publicnode.com". Hipótesis del bug "4 días sin trades":
+# el endpoint "ops" pertenece a una red distinta de la mainnet real
+# (dydx-mainnet-1). El indexer mainnet veía los fondos pero NUNCA veía
+# las órdenes porque iban a otra cadena → 100% NOT_FOUND en audit.
+# publicnode.com es endpoint público oficial de dYdX mainnet.
+# Backups (descomenta si publicnode falla):
+#   "dydx-mainnet-grpc.kingnodes.com"     ← kingnodes pero "mainnet", no "ops"
+#   "dydx-grpc.lavenderfive.com"          ← community pública
+NODE_MAINNET = "dydx-grpc.publicnode.com"
 INDEXER_MAINNET = "https://indexer.dydx.trade"
 WEBSOCKET_MAINNET = "wss://indexer.dydx.trade/v4/ws"
 

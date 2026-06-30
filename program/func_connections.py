@@ -44,7 +44,9 @@ async def connect_dydx():
 
         except Exception as e:
                 print(f"Error in the connection. {e}")
-                # Si falla, devolvemos None para que el main sepa que hubo error
-                return None, None
+                # Si falla, devolvemos None para que el main sepa que hubo error.
+                # 2026-06-02: corregido — antes regresaba (None, None) 2-tuple,
+                # ahora regresa (None, None, None) consistente con el path OK.
+                return None, None, None
 
         return node, indexer, wallet

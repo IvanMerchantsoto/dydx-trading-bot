@@ -49,6 +49,7 @@ sys.path.insert(0, str(SCRIPT_DIR))
 from func_connections import connect_dydx
 from func_private import place_market_order
 from constants import WALLET_ADDRESS
+from v4_proto.dydxprotocol.clob.order_pb2 import Order as _OrderPB
 
 TEST_MARKET = "ETH-USD"
 TEST_SIDE = "BUY"
@@ -176,12 +177,19 @@ async def main():
     print(f"[5/6] >>> ENVIANDO MARKET {TEST_SIDE} {test_size} {TEST_MARKET} ~${notional:.2f} <<<")
     t_send = time.time()
     try:
+        # Firma real: (node, indexer, wallet, market, side, size, price, reduce_only, time_in_force_type)
+        # price es legacy en func_private (se recalcula internamente con oracle*1.05/0.95)
+        # IOC = Immediate Or Cancel — match al uso del bot real
         result = await place_market_order(
-            node, wallet,
-            market=TEST_MARKET,
-            side=TEST_SIDE,
-            size=test_size,
-            reduce_only=False,
+            node,
+            indexer,
+            wallet,
+            TEST_MARKET,
+            TEST_SIDE,
+            test_size,
+            oracle,                       # price (legacy / recalculado)
+            False,                        # reduce_only
+            time_in_force_type=_OrderPB.TimeInForce.TIME_IN_FORCE_IOC,
         )
     except Exception as e:
         print(f"      ❌❌❌ EXCEPCIÓN al enviar orden: {type(e).__name__}: {e}")

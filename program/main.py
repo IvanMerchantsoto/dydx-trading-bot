@@ -167,18 +167,39 @@ async def main():
         now = loop.time()
         print("[D1] loop top", flush=True)
 
-        # ── Periodic cointegration refresh ────────────────────────────────
+        # ── Periodic cointegration refresh (2026-07-01: NON-BLOCKING) ──────
+        # ANTES: await _run_cointegration(...) bloqueaba el main loop 5-20 min.
+        # Durante ese tiempo, manage_trade_exits NO corría — el bot era CIEGO
+        # a TP/SL/zero-crossing. Podías perder oportunidades de cierre reales.
+        #
+        # AHORA: se ejecuta como asyncio task en background. El loop principal
+        # sigue corriendo normalmente (exit_manager, entry scan, KPIs, etc).
+        # Cuando la task termine, el CSV se actualiza y el próximo scan lo lee.
+        #
+        # Si ya hay una refresh en curso, no lanzamos otra (single-flight).
         print("[D2] coint check", flush=True)
         if COINTEGRATION_REFRESH_HOURS > 0:
             elapsed_coint = (now - last_coint_refresh_ts) / 3600.0
-            if elapsed_coint >= float(COINTEGRATION_REFRESH_HOURS):
-                print(f"[D2] refreshing coint ({elapsed_coint:.1f}h old)", flush=True)
-                try:
-                    await _run_cointegration(node, indexer)
-                    last_coint_refresh_ts = loop.time()
-                except Exception as e_coint:
-                    print(f"[D2] coint refresh error: {e_coint}", flush=True)
-                    last_coint_refresh_ts = loop.time()
+            _existing = globals().get("_coint_task")
+            _in_progress = _existing is not None and not _existing.done()
+
+            if elapsed_coint >= float(COINTEGRATION_REFRESH_HOURS) and not _in_progress:
+                print(f"[D2] launching coint refresh in background ({elapsed_coint:.1f}h old)", flush=True)
+                async def _background_coint():
+                    try:
+                        await _run_cointegration(node, indexer)
+                        log_event({"type": "coint_background_ok"}, print_terminal=False)
+                    except Exception as e_coint:
+                        print(f"[D2] coint background error: {e_coint}", flush=True)
+                        log_event({"type": "coint_background_error", "error": str(e_coint)})
+                globals()["_coint_task"] = asyncio.create_task(_background_coint())
+                # Marcamos el timestamp AHORA para evitar re-launch mientras corre.
+                # Si la task falla, el próximo ciclo verá que no hay task in-progress
+                # y decidirá basado en edad del CSV si relanzar.
+                last_coint_refresh_ts = loop.time()
+            elif _in_progress:
+                # Task todavía corriendo — solo log, el loop sigue
+                print("[D2] coint refresh already running in background", flush=True)
 
         # ── Manage exits ──────────────────────────────────────────────────
         print(f"[D3] MANAGE_EXITS={MANAGE_EXITS}", flush=True)

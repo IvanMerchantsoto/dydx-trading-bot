@@ -226,26 +226,30 @@ class BotAgent:
         })
 
         # =========================================================
-        # PRE-FLIGHT SPREAD CEILING CHECK (2026-07-01 fix)
+        # PRE-FLIGHT SPREAD CHECK (2026-07-01 v2 fix)
         # =========================================================
-        # ANTES de enviar PREPARE (que gasta 2 tx del chain), verificamos
-        # el ceiling de spread. Si alguna leg tiene spread > CEILING, no
-        # hay razón para intentar el trade — el spread_check completo lo
-        # rechazaría 22s después de todos modos.
+        # Verifica AMBOS gates ANTES de enviar PREPARE (que gasta 2 tx):
+        #   1. CEILING: si alguna leg > 250bps → skip
+        #   2. EDGE_PCT: si cost > max_pct × expected_edge → skip
         #
-        # Caso real (BNB/XMR, 2026-07-01): bot intentó 8 veces el mismo par
-        # cada 40s, cada uno enviando 2 PREPARE txs (= 16 tx desperdiciadas).
-        # XMR tenía spread=652bps, ceiling=250bps → nunca iba a pasar.
-        #
-        # El full spread_check (con edge-proportional check) sigue existiendo
-        # DESPUÉS de PREPARE porque necesita el expected_edge_usd calculado.
-        # Este pre-flight es solo el ceiling — el gate más caro y evitable.
+        # v2 (2026-07-01): añadido edge-proportional check al pre-flight.
+        # v1 solo bloqueaba CEILING, dejando SPREAD_COST_EXCEEDS_EDGE_PCT
+        # que se detectaba DESPUÉS de PREPARE. Data del log del usuario:
+        #   113 SKIPPED post-prepare hoy × 2 tx_limit c/u = 226 orders wasted
+        # Casi todos eran SPREAD_COST_EXCEEDS_EDGE (no CEILING).
+        # Con este fix, se ahorra el 100% de esos 226 tx.
         try:
             pf_spread1, pf_spread2 = await asyncio.gather(
                 get_market_spread_bps(self.indexer, self.market_1),
                 get_market_spread_bps(self.indexer, self.market_2),
             )
             pf_ceiling = float(SPREAD_GATE_PER_LEG_CEILING_BPS)
+            pf_floor = float(SPREAD_GATE_PER_LEG_FLOOR_BPS)
+            pf_max_pct = float(SPREAD_GATE_MAX_PCT_OF_EDGE)
+            pf_notional = float(self.intended_usd_per_trade or 0.0)
+            pf_edge = float(self.expected_edge_usd or 0.0)
+
+            # Gate 1: Ceiling (any leg way too wide)
             pf_s1_wide = (pf_spread1 is not None) and (pf_spread1 > pf_ceiling)
             pf_s2_wide = (pf_spread2 is not None) and (pf_spread2 > pf_ceiling)
             if pf_s1_wide or pf_s2_wide:
@@ -268,6 +272,46 @@ class BotAgent:
                     "stage": "pre_prepare",
                 })
                 return self.order_dict
+
+            # Gate 2: Edge-proportional (only meaningful if we have both edge and notional)
+            # Floor pass: si AMBAS legs están debajo del floor, no aplicar edge check
+            # (spread es tan tight que siempre vale la pena intentarlo)
+            pf_s1_below_floor = (pf_spread1 is None) or (pf_spread1 <= pf_floor)
+            pf_s2_below_floor = (pf_spread2 is None) or (pf_spread2 <= pf_floor)
+            pf_floor_pass = pf_s1_below_floor and pf_s2_below_floor
+
+            if not pf_floor_pass and pf_edge > 0 and pf_notional > 0:
+                pf_s1_val = float(pf_spread1) if pf_spread1 is not None else 0.0
+                pf_s2_val = float(pf_spread2) if pf_spread2 is not None else 0.0
+                pf_cost_usd = (pf_s1_val + pf_s2_val) * pf_notional / 10000.0
+                pf_max_cost = pf_max_pct * pf_edge
+                if pf_cost_usd > pf_max_cost:
+                    reason = (
+                        f"SPREAD_COST_EXCEEDS_EDGE_PCT_PREFLIGHT: "
+                        f"cost=${pf_cost_usd:.2f} > max=${pf_max_cost:.2f} "
+                        f"({pf_max_pct*100:.0f}% of edge=${pf_edge:.2f}) "
+                        f"| s1={pf_s1_val:.1f}bps s2={pf_s2_val:.1f}bps"
+                    )
+                    self.order_dict["pair_status"] = "SKIPPED"
+                    self.order_dict["comments"] = reason
+                    log_event({
+                        "type": "spread_check",
+                        "trace_id": self.trace_id,
+                        "market_1": self.market_1,
+                        "market_2": self.market_2,
+                        "spread_1_bps": round(pf_s1_val, 2),
+                        "spread_2_bps": round(pf_s2_val, 2),
+                        "notional_per_leg": pf_notional,
+                        "expected_edge_usd": round(pf_edge, 4),
+                        "spread_cost_usd": round(pf_cost_usd, 4),
+                        "max_cost_usd": round(pf_max_cost, 4),
+                        "max_pct_of_edge": pf_max_pct,
+                        "rule": "edge_pct_block_preflight",
+                        "reason": reason,
+                        "ok": False,
+                        "stage": "pre_prepare",
+                    })
+                    return self.order_dict
         except Exception as _pfe:
             # On any error in pre-flight, continue to normal flow (backward compat)
             log_event({

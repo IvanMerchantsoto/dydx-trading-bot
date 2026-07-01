@@ -171,13 +171,49 @@ async def _get_subaccount(indexer):
 
 
 async def _get_live_markets_with_position(indexer):
-    """Return a set of markets that currently have a non-zero open position."""
-    sub = await _get_subaccount(indexer)
-    positions = sub.get("openPerpetualPositions", {}) or sub.get("perpetualPositions", {}) or {}
+    """
+    Return a set of markets that currently have a non-zero open position.
+
+    2026-07-01 fix: incluye TANTO las posiciones del indexer (chain state) COMO
+    las de bot_agents.json (local state). Razón: hay ~1-5s de lag entre que
+    el bot abre un par (chain update) y el indexer lo refleja. Si el scan
+    siguiente corre en esa ventana, live_markets NO incluye el par recién
+    abierto → bot intenta abrir OTRO par con leg compartida → PRE_COMMIT_
+    EXPOSURE_DETECTED lo caza pero gasta 2 tx_limit inútiles.
+
+    Caso real (2026-07-01): OP/SEI abrió, siguiente scan intentó ETC/OP, error.
+
+    La unión (chain ∪ json) evita este race sin sacrificar correctitud —
+    si el JSON tiene un par que ya cerró pero el indexer aún no lo refleja,
+    el resultado es "no abrir un trade que compartiría leg", que es lo
+    correcto (conservador).
+    """
     live = set()
-    for m, p in positions.items():
-        if abs(_sf(p.get("size"))) > 0:
-            live.add(m)
+
+    # 1. Del indexer (chain state real)
+    try:
+        sub = await _get_subaccount(indexer)
+        positions = sub.get("openPerpetualPositions", {}) or sub.get("perpetualPositions", {}) or {}
+        for m, p in positions.items():
+            if abs(_sf(p.get("size"))) > 0:
+                live.add(m)
+    except Exception:
+        pass
+
+    # 2. De bot_agents.json (local state — catches recent opens antes de indexer lag)
+    try:
+        with open(JSON_PATH, "r") as f:
+            bot_agents = json.load(f) or []
+        for pair in bot_agents:
+            if not isinstance(pair, dict):
+                continue
+            m1 = pair.get("market_1")
+            m2 = pair.get("market_2")
+            if m1: live.add(m1)
+            if m2: live.add(m2)
+    except Exception:
+        pass
+
     return live
 
 

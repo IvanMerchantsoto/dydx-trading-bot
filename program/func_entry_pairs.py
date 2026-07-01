@@ -907,6 +907,18 @@ async def open_positions(
                 "quote": quote_market,
                 "reason": skip_reason,
             })
+            # 2026-07-01 fix: SPREAD_CEILING es un gate que probablemente seguirá
+            # bloqueando por horas (spreads en mercados ilíquidos no cambian rápido).
+            # Sin cooldown, el bot re-intenta el mismo par cada 40s indefinidamente
+            # (caso real: BNB/XMR 8 intentos en 5 min gastando 16 PREPARE txs).
+            # Registramos hit para activar cooldown 4h tras 3 skips consecutivos.
+            if "SPREAD_CEILING" in skip_reason:
+                fail_count = _record_pair_fail(base_market, quote_market)
+                if fail_count >= PAIR_FAIL_COOLDOWN_THRESHOLD:
+                    log_event({"type": "pair_fail_cooldown_set", "base": base_market,
+                               "quote": quote_market, "consecutive_fails": fail_count,
+                               "cooldown_hours": PAIR_FAIL_COOLDOWN_HOURS,
+                               "trigger": "spread_ceiling_repeated"})
             continue
 
         # Not LIVE: check for orphan exposure, gated on committed flag.

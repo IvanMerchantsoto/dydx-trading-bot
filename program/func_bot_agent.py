@@ -226,6 +226,57 @@ class BotAgent:
         })
 
         # =========================================================
+        # PRE-FLIGHT SPREAD CEILING CHECK (2026-07-01 fix)
+        # =========================================================
+        # ANTES de enviar PREPARE (que gasta 2 tx del chain), verificamos
+        # el ceiling de spread. Si alguna leg tiene spread > CEILING, no
+        # hay razón para intentar el trade — el spread_check completo lo
+        # rechazaría 22s después de todos modos.
+        #
+        # Caso real (BNB/XMR, 2026-07-01): bot intentó 8 veces el mismo par
+        # cada 40s, cada uno enviando 2 PREPARE txs (= 16 tx desperdiciadas).
+        # XMR tenía spread=652bps, ceiling=250bps → nunca iba a pasar.
+        #
+        # El full spread_check (con edge-proportional check) sigue existiendo
+        # DESPUÉS de PREPARE porque necesita el expected_edge_usd calculado.
+        # Este pre-flight es solo el ceiling — el gate más caro y evitable.
+        try:
+            pf_spread1, pf_spread2 = await asyncio.gather(
+                get_market_spread_bps(self.indexer, self.market_1),
+                get_market_spread_bps(self.indexer, self.market_2),
+            )
+            pf_ceiling = float(SPREAD_GATE_PER_LEG_CEILING_BPS)
+            pf_s1_wide = (pf_spread1 is not None) and (pf_spread1 > pf_ceiling)
+            pf_s2_wide = (pf_spread2 is not None) and (pf_spread2 > pf_ceiling)
+            if pf_s1_wide or pf_s2_wide:
+                wide_m = self.market_1 if pf_s1_wide else self.market_2
+                wide_bps = pf_spread1 if pf_s1_wide else pf_spread2
+                reason = f"SPREAD_CEILING_PREFLIGHT: {wide_m} {wide_bps:.1f}bps > {pf_ceiling:.0f}bps"
+                self.order_dict["pair_status"] = "SKIPPED"
+                self.order_dict["comments"] = reason
+                log_event({
+                    "type": "spread_check",
+                    "trace_id": self.trace_id,
+                    "market_1": self.market_1,
+                    "market_2": self.market_2,
+                    "spread_1_bps": round(pf_spread1, 2) if pf_spread1 is not None else None,
+                    "spread_2_bps": round(pf_spread2, 2) if pf_spread2 is not None else None,
+                    "ceiling_bps": pf_ceiling,
+                    "rule": "ceiling_block_preflight",
+                    "reason": reason,
+                    "ok": False,
+                    "stage": "pre_prepare",
+                })
+                return self.order_dict
+        except Exception as _pfe:
+            # On any error in pre-flight, continue to normal flow (backward compat)
+            log_event({
+                "type": "spread_preflight_error",
+                "trace_id": self.trace_id,
+                "error": str(_pfe),
+            }, print_terminal=False)
+
+        # =========================================================
         # PHASE 1: PREPARE
         # =========================================================
         # Creamos ambas órdenes como LIMIT POST_ONLY no ejecutables
@@ -776,15 +827,88 @@ class BotAgent:
                         time_in_force_type=Order.TimeInForce.TIME_IN_FORCE_IOC,
                     )
 
-                self.order_dict["pair_status"] = "FAILED"
-                self.order_dict["comments"] = f"Residual too large -> flattened. residual_usd={residual_usd:.2f}"
+                # 2026-07-01 FIX: después de flatten, el par está BALANCEADO
+                # a un tamaño menor. En vez de marcar FAILED + orphan_saved
+                # (que dejaba las 2 legs sin management), ahora:
+                #   1. Consultamos indexer para ver los tamaños reales post-flatten
+                #   2. Si notionals están balanceados dentro de tol → LIVE con tamaño reducido
+                #   3. Si sigue habiendo imbalance grande → FAILED (flatten no completó)
+                #
+                # Caso real (XRP/PENGU 2026-07-01): partial fills causaron $8.80
+                # residual. Post-flatten, ambas legs quedaron en ~$20.76. El bot
+                # antes decía FAILED y las abandonaba (orphan). Ahora las mantiene
+                # como par LIVE de menor tamaño, monitoreadas por exit_manager.
+                #
+                # Espera 3s a que el flatten aparezca en indexer.
+                await asyncio.sleep(3.0)
+                try:
+                    live_post_flatten = await get_live_positions(self.indexer, min_usd=0.5)
+                    m1_pos = live_post_flatten.get(self.market_1, {})
+                    m2_pos = live_post_flatten.get(self.market_2, {})
+                    real_size_m1 = abs(float(m1_pos.get("size", 0) or 0))
+                    real_size_m2 = abs(float(m2_pos.get("size", 0) or 0))
+                    real_usd_m1 = real_size_m1 * float(self.base_price)
+                    real_usd_m2 = real_size_m2 * float(self.quote_price)
+                    new_residual = real_usd_m1 - real_usd_m2
+                    new_effective = max(1e-9, min(real_usd_m1, real_usd_m2))
+                    new_tol = max(2.0, 0.05 * new_effective)  # relax un poco post-flatten
 
-                log_event({
-                    "type": "flattened_residual",
-                    "trace_id": self.trace_id,
-                    "residual_usd": residual_usd,
-                })
-                return self.order_dict
+                    log_event({
+                        "type": "flattened_residual",
+                        "trace_id": self.trace_id,
+                        "residual_usd_before": residual_usd,
+                        "residual_usd_after": new_residual,
+                        "size_1_after": real_size_m1,
+                        "size_2_after": real_size_m2,
+                        "usd_1_after": real_usd_m1,
+                        "usd_2_after": real_usd_m2,
+                    })
+
+                    # Ambas legs deben tener tamaño real > 0 y estar balanceadas
+                    if real_size_m1 > 0 and real_size_m2 > 0 and abs(new_residual) <= new_tol:
+                        # ✅ Balanceado — actualizar order_dict con sizes reales y marcar LIVE
+                        self.order_dict["filled_size_1"] = real_size_m1
+                        self.order_dict["filled_size_2"] = real_size_m2
+                        self.order_dict["filled_usd_1"] = real_usd_m1
+                        self.order_dict["filled_usd_2"] = real_usd_m2
+                        self.order_dict["residual_usd"] = float(new_residual)
+                        self.order_dict["residual_tol"] = float(new_tol)
+                        # Marca que se ajustó pero es válido
+                        self.order_dict["comments"] = (
+                            f"OK (auto-rebalanced from partial fill: "
+                            f"initial_residual=${residual_usd:.2f} → "
+                            f"final=${new_residual:.2f}, "
+                            f"leg_notional=${new_effective:.2f})"
+                        )
+                        # NO return aquí — dejamos que continúe al final para
+                        # marcar LIVE y hacer el reconcile check final
+                        log_event({
+                            "type": "flatten_ok_kept_live",
+                            "trace_id": self.trace_id,
+                            "effective_usd": new_effective,
+                            "reduction_pct": round(100 * (1 - new_effective / max(filled_usd_1, filled_usd_2)), 1),
+                        })
+                        # Actualizar variables locales para el logging post-flatten
+                        filled_usd_1 = real_usd_m1
+                        filled_usd_2 = real_usd_m2
+                    else:
+                        # Sigue imbalanceado o una leg quedó en 0 → FAILED real
+                        self.order_dict["pair_status"] = "FAILED"
+                        self.order_dict["comments"] = (
+                            f"Flatten incomplete: residual_after=${new_residual:.2f} "
+                            f"tol=${new_tol:.2f} sizes=({real_size_m1}, {real_size_m2})"
+                        )
+                        return self.order_dict
+                except Exception as _fe:
+                    # Si el reconcile post-flatten falla → asumimos incierto, FAILED
+                    log_event({
+                        "type": "flatten_reconcile_error",
+                        "trace_id": self.trace_id,
+                        "error": str(_fe),
+                    })
+                    self.order_dict["pair_status"] = "FAILED"
+                    self.order_dict["comments"] = f"Flatten reconcile fail: {_fe}"
+                    return self.order_dict
 
             except Exception as e:
                 self.order_dict["pair_status"] = "ERROR"

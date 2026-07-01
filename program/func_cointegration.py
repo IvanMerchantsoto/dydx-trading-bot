@@ -228,6 +228,35 @@ def store_cointegration_results(df_market_prices):
                             continue
 
                     # ── Passes all filters ──────────────────────────────────
+                    # 2026-07-01: compute per-pair z-score distribution to
+                    # derive DYNAMIC entry/exit thresholds. Instead of using
+                    # global ZSCORE_THRESH=2.7 and Z_TP=0.7 for ALL pairs,
+                    # each pair gets thresholds based on its OWN volatility:
+                    #   z_entry_threshold = p95 of |z| history (top 5% events)
+                    #   z_exit_threshold  = p30 of |z| history (bottom 30% quiet)
+                    #
+                    # Sanity limits prevent extreme values:
+                    #   entry: clamped to [2.0, 4.0]
+                    #   exit:  clamped to [0.3, 1.5]
+                    try:
+                        spread_series = pd.Series(spread_arr)
+                        z_hist_mean = spread_series.rolling(window=WINDOW).mean()
+                        z_hist_std = spread_series.rolling(window=WINDOW).std()
+                        z_hist = (spread_series - z_hist_mean) / z_hist_std
+                        z_abs = z_hist.dropna().abs().values
+                        if len(z_abs) >= 20:  # need enough samples
+                            z_entry_dyn = float(np.percentile(z_abs, 95))
+                            z_exit_dyn = float(np.percentile(z_abs, 30))
+                            # Clamp to safe range
+                            z_entry_dyn = max(2.0, min(4.0, z_entry_dyn))
+                            z_exit_dyn = max(0.3, min(1.5, z_exit_dyn))
+                        else:
+                            z_entry_dyn = 2.7   # fallback to global default
+                            z_exit_dyn = 0.7
+                    except Exception:
+                        z_entry_dyn = 2.7
+                        z_exit_dyn = 0.7
+
                     half_lives_seen.append(half_life)
                     criteria_met_pairs.append({
                         "base_market": base_market,
@@ -236,6 +265,9 @@ def store_cointegration_results(df_market_prices):
                         "half_life": half_life,
                         "hurst": round(hurst, 3) if not np.isnan(hurst) else None,
                         "r_squared": round(r_sq, 4) if not np.isnan(r_sq) else None,
+                        # 2026-07-01: dynamic thresholds per-pair
+                        "z_entry_threshold": round(z_entry_dyn, 3),
+                        "z_exit_threshold":  round(z_exit_dyn, 3),
                     })
 
             except Exception as e:
@@ -284,8 +316,9 @@ def store_cointegration_results(df_market_prices):
     if not df_criteria_met.empty:
         df_criteria_met.sort_values("half_life", ascending=True, inplace=True)
         df_criteria_met.reset_index(drop=True, inplace=True)
-        # Ensure column order (hurst optional — old CSVs won't have it)
-        cols = ["base_market", "quote_market", "hedge_ratio", "half_life", "hurst", "r_squared"]
+        # Ensure column order (new columns optional for backwards compat)
+        cols = ["base_market", "quote_market", "hedge_ratio", "half_life",
+                "hurst", "r_squared", "z_entry_threshold", "z_exit_threshold"]
         cols = [c for c in cols if c in df_criteria_met.columns]
         df_criteria_met = df_criteria_met[cols]
     df_criteria_met.to_csv(CSV_PATH, index=True)

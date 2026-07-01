@@ -545,7 +545,17 @@ async def open_positions(
             _max_z_seen = abs(z_score)
             _best_low_z_pair = f"{base_market}/{quote_market}"
 
-        if abs(z_score) < ZSCORE_THRESH:
+        # 2026-07-01: DYNAMIC per-pair entry threshold.
+        # Cada par tiene su propio z_entry_threshold basado en p95 de su
+        # distribución histórica de |z|. Fallback al global ZSCORE_THRESH
+        # si el CSV es viejo y no tiene la columna.
+        _z_entry_dyn = row.get("z_entry_threshold") if "z_entry_threshold" in row.index else None
+        try:
+            _z_entry_dyn = float(_z_entry_dyn) if _z_entry_dyn is not None and not pd.isna(_z_entry_dyn) else float(ZSCORE_THRESH)
+        except Exception:
+            _z_entry_dyn = float(ZSCORE_THRESH)
+
+        if abs(z_score) < _z_entry_dyn:
             _skip_low_z += 1
             continue
 
@@ -619,6 +629,14 @@ async def open_positions(
         hl_f = max(1.0, float(half_life or 20.0))
         score = abs(z_score) * (1.0 / hl_f) * (100.0 / max(1.0, spread_bps))
 
+        # 2026-07-01: pass dynamic z_exit_threshold to candidate dict
+        # so BotAgent + exit_manager can use per-pair exit level.
+        _z_exit_dyn = row.get("z_exit_threshold") if "z_exit_threshold" in row.index else None
+        try:
+            _z_exit_dyn = float(_z_exit_dyn) if _z_exit_dyn is not None and not pd.isna(_z_exit_dyn) else 0.7
+        except Exception:
+            _z_exit_dyn = 0.7
+
         candidates.append({
             "base_market": base_market,
             "quote_market": quote_market,
@@ -638,6 +656,8 @@ async def open_positions(
             "score": score,
             "spread_std": spread_std,
             "spread_mean": spread_mean,
+            "z_entry_threshold_dyn": _z_entry_dyn,   # for logging / audit
+            "z_exit_threshold_dyn": _z_exit_dyn,     # used by exit manager
         })
 
         # Actualizar contadores de concentración por mercado
@@ -828,6 +848,11 @@ async def open_positions(
             expected_edge_usd=approx_spread_usd,   # 2026-05-26: needed for dynamic spread gate
             min_m1_fill_usd=dynamic_min_fill,      # 2026-05-26: scales with eff_usd
         )
+
+        # 2026-07-01: pasar z_exit_threshold dinámico al order_dict que se
+        # persistirá en bot_agents.json. El exit manager lo leerá desde ahí.
+        bot_agent.order_dict["z_exit_threshold_dyn"] = float(cand.get("z_exit_threshold_dyn", 0.7))
+        bot_agent.order_dict["z_entry_threshold_dyn"] = float(cand.get("z_entry_threshold_dyn", 2.7))
 
         bot_open_dict = await bot_agent.open_trades(wallet)
 

@@ -612,11 +612,16 @@ async def manage_trade_exits(node, indexer, wallet):
         # Estándar: cierra cuando |z| ≤ Z_TP (umbral fijo).
         tp_zone = False
         if USE_Z_TP and (z_now is not None):
+            # 2026-07-01: DYNAMIC per-pair exit threshold.
+            # Cada par tiene su propio z_exit_threshold_dyn calculado en
+            # cointegración (p30 de |z| histórico). Fallback a Z_TP global.
+            _z_tp_dyn = float(position.get("z_exit_threshold_dyn", Z_TP) or Z_TP)
+
             if TRAIL_TP_ENABLED:
                 best_z_val = _sf(position.get("best_z", abs(z_now)))
-                # TP zone se activa cuando z ya llegó al umbral (best_z ≤ Z_TP)
+                # TP zone se activa cuando z ya llegó al umbral (best_z ≤ z_tp_dyn)
                 # Y ahora ha rebotado TRAIL_Z_PULLBACK desde su mínimo.
-                in_tp_zone = best_z_val <= float(Z_TP)
+                in_tp_zone = best_z_val <= _z_tp_dyn
                 # Floor: si z llegó muy cerca de 0, cerrar inmediatamente
                 floor_hit = best_z_val <= float(TRAIL_Z_FLOOR)
                 # Pullback: z ha subido TRAIL_Z_PULLBACK desde el mejor z
@@ -635,13 +640,14 @@ async def manage_trade_exits(node, indexer, wallet):
                     })
             elif USE_TP_HYSTERESIS:
                 prev_in_zone = bool(position.get("tp_in_zone", False))
-                if (not prev_in_zone) and abs(z_now) <= float(Z_TP_IN):
+                if (not prev_in_zone) and abs(z_now) <= _z_tp_dyn:
                     tp_zone = True
-                elif prev_in_zone and abs(z_now) <= float(Z_TP_OUT):
+                elif prev_in_zone and abs(z_now) <= (_z_tp_dyn + 0.15):
                     tp_zone = True
                 position["tp_in_zone"] = tp_zone
             else:
-                tp_zone = abs(z_now) <= float(Z_TP)
+                # 2026-07-01: usa el z_exit_threshold_dyn en vez del Z_TP global
+                tp_zone = abs(z_now) <= _z_tp_dyn
 
         tp_confirm = int(position.get("tp_confirm", 0) or 0)
 
@@ -668,7 +674,7 @@ async def manage_trade_exits(node, indexer, wallet):
                     if ok_profit:
                         is_close = True
                         close_reason = (
-                            f"TP: abs(z={z_now:.3f}) <= {Z_TP} "
+                            f"TP: abs(z={z_now:.3f}) <= {_z_tp_dyn:.3f} (dyn) "
                             f"confirms={tp_confirm} "
                             f"| pnl_gross={pnl_gross:.2f} "
                             f"| fees={open_fees_paid + close_fees_est:.2f} "

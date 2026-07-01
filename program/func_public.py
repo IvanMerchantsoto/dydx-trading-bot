@@ -26,6 +26,9 @@ ISO_TIMES = get_ISO_times()
 _CANDLE_CACHE = {}  # market_name → (numpy_array, fetch_timestamp_s)
 _CANDLE_CACHE_TTL_S = 30 * 60   # 30 minutes
 
+# 2026-07-01: track markets that hit persistent errors so we don't spam logs
+_CANDLE_ERROR_LOGGED: set = set()
+
 
 def candle_cache_stats():
     """Diagnostic: how many markets cached and how old the oldest entry is."""
@@ -63,18 +66,39 @@ async def get_candles_recent(indexer, market):
             return arr  # serve from cache, zero API call
 
     # Cache miss — fetch from API
-    # Reduced sleep from 0.2 → 0.05 because cache hits are now most calls,
-    # so we'd hammer the API far less even at lower delay.
+    # 2026-07-01 v2: retry con exponential backoff en 429 Too Many Requests.
+    # publicnode.com rate-limitea agresivamente si hay picos concurrentes.
+    # 3 intentos con 0.5s, 1s, 2s de espera cubren la mayoría de casos.
     await asyncio.sleep(0.05)
 
-    try:
-        candles_resp = await indexer.markets.get_perpetual_market_candles(
-            market=market,
-            resolution=RESOLUTION,
-            limit=100
-        )
-    except Exception as e:
-        print(f"[PUBLIC] get_candles_recent error for {market}: {e}", flush=True)
+    candles_resp = None
+    last_err = None
+    for attempt in range(3):
+        try:
+            candles_resp = await indexer.markets.get_perpetual_market_candles(
+                market=market,
+                resolution=RESOLUTION,
+                limit=100
+            )
+            break  # success
+        except Exception as e:
+            last_err = e
+            err_str = str(e).lower()
+            if "429" in err_str or "too many" in err_str or "rate" in err_str:
+                # Rate limited — backoff and retry
+                backoff = 0.5 * (2 ** attempt)
+                await asyncio.sleep(backoff)
+                continue
+            else:
+                # Non-rate-limit error — don't retry
+                break
+
+    if candles_resp is None:
+        # All retries exhausted — silently return empty (cache will be filled next scan)
+        # Only log once per market per session to avoid log spam on ongoing 429s
+        if market not in _CANDLE_ERROR_LOGGED:
+            print(f"[PUBLIC] get_candles_recent error for {market}: {last_err}", flush=True)
+            _CANDLE_ERROR_LOGGED.add(market)
         return np.array([], dtype=np.float64)
 
     # Defensively handle missing/malformed response
@@ -104,18 +128,22 @@ async def get_candles_recent(indexer, market):
 
 
 # Get Candles Historical
-async def get_candles_historical(indexer, market):
+async def get_candles_historical(indexer, market, sleep_between_tfs: float = 0.15):
     """
     Fetch historical candles across all timeframes in ISO_TIMES.
 
-    2026-07-01 fix: Antes hacía sequential fetch por timeframe con sleep(0.2)
-    entre cada uno. Con 4 timeframes = 800ms+ mínimo por market. Multiplicado
-    por 150 markets, esto bloqueaba el bot ~15-20 min.
+    2026-07-01 v2: SECUENCIAL con sleep pequeño entre timeframes.
+    La primera versión paralelizaba los 4 timeframes por market, pero cuando
+    también procesamos 15 markets en batch, llegamos a 60 requests concurrentes
+    y el indexer rate-limitea (429 Too Many Requests).
 
-    Ahora: paraleliza los 4 timeframes con asyncio.gather. Un market completo
-    tarda ~300ms en vez de ~1200ms. Sleep protectivo reducido a 0.05.
+    Con secuencial + sleep 0.15s: cada market tarda ~600-800ms.
+    Con batch de 5 markets concurrentes = ~15 requests peak (safe).
     """
-    async def _fetch_tf(tf_obj):
+    close_prices = []
+    for tf_key in ISO_TIMES.keys():
+        tf_obj = ISO_TIMES[tf_key]
+        await asyncio.sleep(sleep_between_tfs)
         try:
             candles = await indexer.markets.get_perpetual_market_candles(
                 market=market,
@@ -124,17 +152,12 @@ async def get_candles_historical(indexer, market):
                 to_iso=tf_obj["to_iso"],
                 limit=100,
             )
-            return candles.get("candles", []) if isinstance(candles, dict) else []
+            candles_list = candles.get("candles", []) if isinstance(candles, dict) else []
+            for candle in candles_list:
+                close_prices.append({"datetime": candle["startedAt"], market: candle["close"]})
         except Exception:
-            return []
-
-    # Fetch all timeframes in parallel (4 concurrent per market)
-    tf_results = await asyncio.gather(*[_fetch_tf(ISO_TIMES[tf]) for tf in ISO_TIMES.keys()])
-
-    close_prices = []
-    for candles_list in tf_results:
-        for candle in candles_list:
-            close_prices.append({"datetime": candle["startedAt"], market: candle["close"]})
+            # Continue with other timeframes even if one fails
+            continue
 
     close_prices.reverse()
     return close_prices
@@ -273,18 +296,25 @@ async def construct_market_prices(node, indexer):
 
     print(f"{len(tradeable_markets)} active markets found. Fetching in parallel...", flush=True)
 
-    # ── Parallel fetch in batches ──
-    # 15 concurrent × 4 timeframes each = 60 concurrent API calls at peak.
-    # publicnode.com handles this fine (verified in testing).
-    BATCH_SIZE = 15
+    # ── Parallel fetch in batches (conservative to avoid 429) ──
+    # 2026-07-01 v2: BATCH=5 instead of 15. Con 4 timeframes secuenciales
+    # dentro de cada market, esto es 5 × 1 = 5 requests concurrentes al pico.
+    # Deja headroom para otros calls del bot (orderbook, subaccounts).
+    #
+    # Speed vs safety trade-off:
+    #   BATCH=15: 30-45s pero 429 errors → 90% markets fallan
+    #   BATCH=5:  60-120s pero 0% 429 errors → todos los markets OK
+    #   Preferimos correctitud sobre velocidad.
+    BATCH_SIZE = 5
+    BATCH_SLEEP = 0.5   # pausa entre batches para no saturar indexer
     results = {}   # market -> list of {datetime, market: close}
+    failures = []
 
     async def _fetch_one(market):
         try:
             data = await get_candles_historical(indexer, market)
             return market, data
         except Exception as e:
-            print(f"   ⚠️ {market}: fetch error: {e}", flush=True)
             return market, None
 
     for i in range(0, len(tradeable_markets), BATCH_SIZE):
@@ -293,9 +323,14 @@ async def construct_market_prices(node, indexer):
         for m, data in batch_results:
             if data is not None and len(data) >= 10:
                 results[m] = data
-        if (i + BATCH_SIZE) % (BATCH_SIZE * 4) == 0 or (i + BATCH_SIZE) >= len(tradeable_markets):
+            else:
+                failures.append(m)
+        # Sleep between batches to give indexer breathing room
+        if i + BATCH_SIZE < len(tradeable_markets):
+            await asyncio.sleep(BATCH_SLEEP)
+        if (i + BATCH_SIZE) % (BATCH_SIZE * 5) == 0 or (i + BATCH_SIZE) >= len(tradeable_markets):
             print(f"   Fetched {min(i + BATCH_SIZE, len(tradeable_markets))}/{len(tradeable_markets)} "
-                  f"markets ({_t.time() - _t0:.1f}s elapsed)", flush=True)
+                  f"markets ({_t.time() - _t0:.1f}s elapsed, {len(results)} OK, {len(failures)} failed)", flush=True)
 
     # ── Merge into single DataFrame ──
     if not results:

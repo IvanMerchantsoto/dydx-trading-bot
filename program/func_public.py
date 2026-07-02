@@ -132,32 +132,65 @@ async def get_candles_historical(indexer, market, sleep_between_tfs: float = 0.1
     """
     Fetch historical candles across all timeframes in ISO_TIMES.
 
-    2026-07-01 v2: SECUENCIAL con sleep pequeño entre timeframes.
-    La primera versión paralelizaba los 4 timeframes por market, pero cuando
-    también procesamos 15 markets en batch, llegamos a 60 requests concurrentes
-    y el indexer rate-limitea (429 Too Many Requests).
+    2026-07-02 v3: retry con backoff + logging visible.
+    v2 silenciaba TODOS los errors → 90% de markets fallaban invisibles
+    (log solo mostraba 2 "429" pero había ~100 silent failures).
+    v3 hace retry 3x con backoff exponencial y loguea WARN si un timeframe
+    fracasa después de todos los retries.
 
-    Con secuencial + sleep 0.15s: cada market tarda ~600-800ms.
-    Con batch de 5 markets concurrentes = ~15 requests peak (safe).
+    Con secuencial + sleep 0.15s: cada market tarda ~600-800ms (base).
+    Con retries en 429: hasta 3-5s por market en peor caso.
     """
+    import warnings as _w
     close_prices = []
+    tf_errors = 0
+
     for tf_key in ISO_TIMES.keys():
         tf_obj = ISO_TIMES[tf_key]
         await asyncio.sleep(sleep_between_tfs)
-        try:
-            candles = await indexer.markets.get_perpetual_market_candles(
-                market=market,
-                resolution=RESOLUTION,
-                from_iso=tf_obj["from_iso"],
-                to_iso=tf_obj["to_iso"],
-                limit=100,
-            )
-            candles_list = candles.get("candles", []) if isinstance(candles, dict) else []
-            for candle in candles_list:
-                close_prices.append({"datetime": candle["startedAt"], market: candle["close"]})
-        except Exception:
-            # Continue with other timeframes even if one fails
-            continue
+
+        # Retry loop with exponential backoff
+        candles_resp = None
+        last_err = None
+        for attempt in range(3):
+            try:
+                candles_resp = await indexer.markets.get_perpetual_market_candles(
+                    market=market,
+                    resolution=RESOLUTION,
+                    from_iso=tf_obj["from_iso"],
+                    to_iso=tf_obj["to_iso"],
+                    limit=100,
+                )
+                break  # success
+            except Exception as e:
+                last_err = e
+                err_str = str(e).lower()
+                if "429" in err_str or "too many" in err_str or "rate" in err_str:
+                    # 429 → aggressive backoff
+                    await asyncio.sleep(1.0 * (2 ** attempt))
+                    continue
+                elif "500" in err_str or "502" in err_str or "503" in err_str or "504" in err_str:
+                    # 5xx server error → shorter backoff
+                    await asyncio.sleep(0.5 * (2 ** attempt))
+                    continue
+                else:
+                    # Other errors — no retry
+                    break
+
+        if candles_resp is None:
+            tf_errors += 1
+            continue  # skip this timeframe, try next
+
+        candles_list = candles_resp.get("candles", []) if isinstance(candles_resp, dict) else []
+        for candle in candles_list:
+            close_prices.append({"datetime": candle["startedAt"], market: candle["close"]})
+
+    # If all timeframes failed, log a summary (once per market per invocation)
+    if tf_errors >= len(ISO_TIMES):
+        # Complete failure — log so we're not blind
+        if market not in _CANDLE_ERROR_LOGGED:
+            print(f"[PUBLIC] get_candles_historical({market}) FAILED all {tf_errors} timeframes. Last err: {last_err}", flush=True)
+            _CANDLE_ERROR_LOGGED.add(market)
 
     close_prices.reverse()
     return close_prices
@@ -297,16 +330,14 @@ async def construct_market_prices(node, indexer):
     print(f"{len(tradeable_markets)} active markets found. Fetching in parallel...", flush=True)
 
     # ── Parallel fetch in batches (conservative to avoid 429) ──
-    # 2026-07-01 v2: BATCH=5 instead of 15. Con 4 timeframes secuenciales
-    # dentro de cada market, esto es 5 × 1 = 5 requests concurrentes al pico.
-    # Deja headroom para otros calls del bot (orderbook, subaccounts).
-    #
-    # Speed vs safety trade-off:
-    #   BATCH=15: 30-45s pero 429 errors → 90% markets fallan
-    #   BATCH=5:  60-120s pero 0% 429 errors → todos los markets OK
-    #   Preferimos correctitud sobre velocidad.
-    BATCH_SIZE = 5
-    BATCH_SLEEP = 0.5   # pausa entre batches para no saturar indexer
+    # 2026-07-02 v3: BATCH=3 + SLEEP=1.5s. Data del log real:
+    #   BATCH=5+SLEEP=0.5: 15/119 OK (13% success) — indexer rate-limit brutal
+    # Con BATCH=3 (~12 concurrent requests peak) + sleep 1.5s entre batches:
+    #   Expected: 80-100/119 OK (~70-85% success)
+    #   Tarda ~3-4 min pero produce CSV completo
+    # Con get_candles_historical con retry+backoff, además recupera 429 fails.
+    BATCH_SIZE = 3
+    BATCH_SLEEP = 1.5   # pausa entre batches para no saturar indexer
     results = {}   # market -> list of {datetime, market: close}
     failures = []
 

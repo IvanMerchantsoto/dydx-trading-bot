@@ -5,14 +5,13 @@ EXIT_CHECK_SECONDS = 30       # cada cuánto evalúas exits (segundos)
 KPI_SECONDS = 600             # cada cuánto mandas KPIs (10 min)
 SESSION_SUMMARY_SECONDS = 300 # cada cuánto mandas resumen de rentabilidad de sesión (5 min)
 BATCH_OPEN_TRADES = 3         # abrir N trades y luego forzar revisión
-MAX_OPEN_TRADES = 3           # 2026-06-30: subido de 1 a 3.
-                              # Razón: con cross-margin 5x en dYdX, $30/leg requiere
-                              # solo $6 de margin. 3 pares × $12 margin = $36 < $87 free.
-                              # Buffer suficiente para drawdown de hasta -$48 sin tocar
-                              # el min_collateral gate ($30).
-                              # IMPORTANTE: también hay que ajustar el multiplicador
-                              # dinámico en main.py _compute_dynamic_sizing (2.5 → 1.0)
-                              # para que dynamic_max no nos limite por error.
+MAX_OPEN_TRADES = 1           # 2026-07-02: bajado de 3 a 1 mientras diagnóstico.
+                              # Bot perdió dinero overnight con 3 concurrent trades.
+                              # Restaurar a 3 solo después de confirmar que:
+                              #   1. Ningún trade cerró por HARD_SL innecesariamente
+                              #   2. TP dinámico funcionó al menos una vez
+                              #   3. CSV se regeneró como esperado
+                              # Ver bloque "2026-06-30" en git blame para restaurar.
 
 # ===== Exit rules =====
 USE_MIN_PROFIT_TP = True

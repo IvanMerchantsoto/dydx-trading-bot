@@ -694,6 +694,10 @@ async def open_positions(
             "spread_mean": spread_mean,
             "z_entry_threshold_dyn": _z_entry_dyn,   # for logging / audit
             "z_exit_threshold_dyn": _z_exit_dyn,     # used by exit manager
+            # 2026-07-03: Absolute spread tracking to detect false z-convergence
+            # (when rolling mean catches up to spread without spread actually moving)
+            "spread_at_entry": spread_last,          # spread value at open
+            "mean_at_entry": spread_mean_prev,       # rolling mean value at open
         })
 
         # Actualizar contadores de concentración por mercado
@@ -889,6 +893,12 @@ async def open_positions(
         # persistirá en bot_agents.json. El exit manager lo leerá desde ahí.
         bot_agent.order_dict["z_exit_threshold_dyn"] = float(cand.get("z_exit_threshold_dyn", 0.7))
         bot_agent.order_dict["z_entry_threshold_dyn"] = float(cand.get("z_entry_threshold_dyn", 2.7))
+        # 2026-07-03: absolute spread tracking for false-convergence detection
+        try:
+            bot_agent.order_dict["spread_at_entry"] = float(cand.get("spread_at_entry", 0.0))
+            bot_agent.order_dict["mean_at_entry"] = float(cand.get("mean_at_entry", 0.0))
+        except Exception:
+            pass
 
         bot_open_dict = await bot_agent.open_trades(wallet)
 

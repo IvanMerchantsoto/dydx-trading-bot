@@ -386,8 +386,9 @@ async def manage_trade_exits(node, indexer, wallet):
             age_min = (now_utc - opened_at).total_seconds() / 60.0
             age_hours = (now_utc - opened_at).total_seconds() / 3600.0
 
-        # Current z-score
+        # Current z-score + absolute spread (for false-convergence detection)
         z_now = None
+        spread_now = None  # 2026-07-03: valor absoluto del spread ahora
         _z_skip_reason = None
         try:
             series_1 = await get_candles_recent(indexer, m1)
@@ -435,12 +436,15 @@ async def manage_trade_exits(node, indexer, wallet):
                     # Only when z_now is valid (not on error paths).
                     if z_now is not None:
                         spread_mean = float(np.nanmean(spread))
+                        # 2026-07-03: absolute spread value for false-convergence detection
+                        spread_now = float(spread[-1]) if len(spread) > 0 else None
                         log_event({
                             "type": "zscore_live",
                             "trace_id": trace_id,
                             "m1": m1, "m2": m2,
                             "z_now": round(z_now, 4),
                             "z_entry": round(z_entry, 4),
+                            "spread_now": round(spread_now, 6) if spread_now is not None else None,
                             "spread_mean": round(spread_mean, 6),
                             "spread_std": round(spread_std, 6),
                             "n_bars": n,
@@ -708,6 +712,27 @@ async def manage_trade_exits(node, indexer, wallet):
                             f"| min_gross={min_gross_required:.2f}"
                         )
                     elif pnl_gross < 0.0:
+                        # ── SPREAD REVERSION CHECK (2026-07-03) ─────────────────
+                        # Antes de aceptar TP_MEAN_REVERTED con pérdida chica,
+                        # verificar que el spread absoluto REALMENTE convergió
+                        # (no que solo el z bajó por shift del rolling mean).
+                        #
+                        # spread_reversion_ratio:
+                        #   0.0 = spread no se movió del entry
+                        #   1.0 = spread llegó al mean original (100% conv)
+                        #   >1.0 = spread cruzó el mean (overshoot)
+                        #   <0.0 = spread se alejó más (divergió)
+                        spread_reversion_ratio = None
+                        try:
+                            s_entry = float(position.get("spread_at_entry", 0.0) or 0.0)
+                            m_entry = float(position.get("mean_at_entry", 0.0) or 0.0)
+                            distance_entry = s_entry - m_entry
+                            if spread_now is not None and abs(distance_entry) > 1e-9:
+                                distance_now = spread_now - m_entry
+                                spread_reversion_ratio = 1.0 - (distance_now / distance_entry)
+                        except Exception:
+                            pass
+
                         # ── RE-HABILITADO 2026-07-03 (evidencia de bug real) ─────
                         # ANÁLISIS del log de UNI/SUI (24h):
                         #   - z llegó a 0.026 (mean reversion PERFECTA)
@@ -729,17 +754,24 @@ async def manage_trade_exits(node, indexer, wallet):
                         # Además evita el fee bleed prolongado observado en UNI/SUI.
                         MEAN_REVERTED_MAX_LOSS = -0.75  # aceptable pérdida chica
                         MIN_AGE_FOR_LOSS_EXIT_MIN = 30.0
+                        MIN_SPREAD_REVERSION = 0.5  # spread absoluto debe haber convergido >=50%
                         age_ok = (age_min is not None and age_min >= MIN_AGE_FOR_LOSS_EXIT_MIN)
                         loss_within_limit = (pnl_gross >= MEAN_REVERTED_MAX_LOSS)
                         z_clearly_converged = (abs(z_now) <= _z_tp_dyn * 1.2)
+                        # spread_reversion_ok: None (no data) → asume True (backwards-compat).
+                        # Data disponible → requiere convergencia absoluta real.
+                        spread_reversion_ok = (
+                            spread_reversion_ratio is None or
+                            spread_reversion_ratio >= MIN_SPREAD_REVERSION
+                        )
 
-                        if age_ok and loss_within_limit and z_clearly_converged:
+                        if age_ok and loss_within_limit and z_clearly_converged and spread_reversion_ok:
                             is_close = True
                             close_reason = (
                                 f"TP_MEAN_REVERTED: z={z_now:.3f} converged "
-                                f"(threshold {_z_tp_dyn:.3f}), age={age_min:.0f}min, "
-                                f"pnl_gross={pnl_gross:.3f} (accepting small loss to avoid "
-                                f"degradation - fees would have eaten breakeven)"
+                                f"(threshold {_z_tp_dyn:.3f}), spread_rev={spread_reversion_ratio}, "
+                                f"age={age_min:.0f}min, pnl_gross={pnl_gross:.3f} "
+                                f"(accepting small loss)"
                             )
                             log_event({
                                 "type": "tp_mean_reverted",
@@ -748,6 +780,7 @@ async def manage_trade_exits(node, indexer, wallet):
                                 "z_now": round(z_now, 4),
                                 "z_entry": round(z_entry, 4),
                                 "z_threshold_dyn": _z_tp_dyn,
+                                "spread_reversion_ratio": round(spread_reversion_ratio, 3) if spread_reversion_ratio is not None else None,
                                 "pnl_gross": round(pnl_gross, 4),
                                 "net_est": round(net_pnl_est, 4),
                                 "age_min": round(age_min, 1) if age_min else None,
@@ -761,11 +794,13 @@ async def manage_trade_exits(node, indexer, wallet):
                                 "m1": m1, "m2": m2,
                                 "pnl_gross": round(pnl_gross, 4),
                                 "z_now": round(z_now, 4),
+                                "spread_reversion_ratio": round(spread_reversion_ratio, 3) if spread_reversion_ratio is not None else None,
                                 "age_min": round(age_min, 1) if age_min else None,
                                 "gate_failed": (
                                     "age" if not age_ok else
                                     ("loss_too_big" if not loss_within_limit else
-                                     ("z_not_converged" if not z_clearly_converged else "unknown"))
+                                     ("z_not_converged" if not z_clearly_converged else
+                                      ("false_convergence" if not spread_reversion_ok else "unknown")))
                                 ),
                             }, print_terminal=False)
                     else:

@@ -5,17 +5,18 @@ EXIT_CHECK_SECONDS = 30       # cada cuánto evalúas exits (segundos)
 KPI_SECONDS = 600             # cada cuánto mandas KPIs (10 min)
 SESSION_SUMMARY_SECONDS = 300 # cada cuánto mandas resumen de rentabilidad de sesión (5 min)
 BATCH_OPEN_TRADES = 3         # abrir N trades y luego forzar revisión
-MAX_OPEN_TRADES = 2           # 2026-07-02 (evening): subido de 1 a 2.
-                              # Razón: UNI/SUI lleva 11h con z estancado en 1.16 sin llegar
-                              # al TP. Con MAX=1, el capital queda parado.
-                              # MAX=2 permite un segundo trade en paralelo mientras UNI/SUI
-                              # espera convergencia.
-                              # Precauciones:
-                              #  - live_markets check (chain ∪ json) evita compartir legs
-                              #  - MAX_TRADES_PER_MARKET=2 limita concentración
-                              #  - hard_sl_usd=3 por par → worst case -$6 con 2 trades
-                              # Si funciona OK 24h, considerar volver a MAX=3.
-                              # Si empeora, bajar a MAX=1.
+MAX_OPEN_TRADES = 3           # 2026-07-03: subido de 2 a 3.
+                              # Bot ha pasado >24h con 1 par (UNI/SUI) sin cerrar,
+                              # perdiendo oportunidades. Con MAX=3 puede rotar
+                              # capital en varios pares mientras uno se estanca.
+                              # Ya no es la primera vez con MAX=3 — los fixes de
+                              # correlación y pre-flight mitigan el problema
+                              # original de anoche.
+                              # Precauciones activas:
+                              #  - live_markets check (chain ∪ json)
+                              #  - MAX_TRADES_PER_MARKET=2 (concentración)
+                              #  - HARD_SL $3 por par → worst case -$9 con 3
+                              #  - Pre-flight edge/ceiling check
 
 # ===== Exit rules =====
 USE_MIN_PROFIT_TP = True

@@ -596,16 +596,42 @@ async def manage_trade_exits(node, indexer, wallet):
                         "min_required": round(min_gross_required, 4),
                     }, print_terminal=False)
                 elif can_pnl and pnl_gross <= 0:
-                    # Cruzó pero estamos en pérdida (raro pero posible si fees>>profit)
-                    # Mantener: HARD_SL/Z_SL eventualmente lo cerrarán
-                    log_event({
-                        "type": "tp_zero_crossing_blocked_loss",
-                        "trace_id": trace_id,
-                        "m1": m1, "m2": m2,
-                        "z_entry": round(z_entry, 4),
-                        "z_now": round(z_now, 4),
-                        "pnl_gross": round(pnl_gross, 4),
-                    }, print_terminal=False)
+                    # 2026-07-03 fix: no HOLD ciego. Si zero-crossing con pérdida
+                    # chica Y trade tiene edad razonable, cerrar. La política vieja
+                    # de "HOLD hasta HARD_SL/Z_SL" hacía perder MUCHO más ($1.93 en
+                    # UNI/SUI observado) que cerrar en el momento de convergencia.
+                    MEAN_REVERTED_MAX_LOSS_ZC = -0.75
+                    MIN_AGE_FOR_ZC_LOSS_EXIT_MIN = 30.0
+                    age_ok = (age_min is not None and age_min >= MIN_AGE_FOR_ZC_LOSS_EXIT_MIN)
+                    loss_ok = (pnl_gross >= MEAN_REVERTED_MAX_LOSS_ZC)
+                    if age_ok and loss_ok:
+                        is_close = True
+                        close_reason = (
+                            f"TP_ZERO_CROSSED_SMALL_LOSS: z_entry={z_entry:.3f} → "
+                            f"z_now={z_now:.3f} (crossed mean), age={age_min:.0f}min, "
+                            f"pnl_gross={pnl_gross:.3f} (accepting -${abs(pnl_gross):.2f} "
+                            f"to avoid degradation)"
+                        )
+                        log_event({
+                            "type": "tp_zero_crossing_loss_exit",
+                            "trace_id": trace_id,
+                            "m1": m1, "m2": m2,
+                            "z_entry": round(z_entry, 4),
+                            "z_now": round(z_now, 4),
+                            "pnl_gross": round(pnl_gross, 4),
+                            "age_min": round(age_min, 1) if age_min else None,
+                        })
+                    else:
+                        log_event({
+                            "type": "tp_zero_crossing_blocked_loss",
+                            "trace_id": trace_id,
+                            "m1": m1, "m2": m2,
+                            "z_entry": round(z_entry, 4),
+                            "z_now": round(z_now, 4),
+                            "pnl_gross": round(pnl_gross, 4),
+                            "age_min": round(age_min, 1) if age_min else None,
+                            "gate_failed": ("age" if not age_ok else "loss_too_big"),
+                        }, print_terminal=False)
 
         # ── 3. Take-Profit (z reversion + confirmation + fee gate) ──────────
         # Trailing TP: sigue el spread hasta su peak y cierra en el pullback.
@@ -682,31 +708,66 @@ async def manage_trade_exits(node, indexer, wallet):
                             f"| min_gross={min_gross_required:.2f}"
                         )
                     elif pnl_gross < 0.0:
-                        # ── DISABLED 2026-05-21 (Bug #1 fix) ──────────────────
-                        # Antiguo TP_LOSS_EXIT: cerraba pagando fees cuando z revirtió
-                        # pero gross_pnl<0. Análisis del log 2026-05-20/22 mostró que
-                        # 9 de 14 cierres siguieron esta rama y todos terminaron con
-                        # net_pnl_est entre -$1 y -$2 (fees comieron el casi-empate).
+                        # ── RE-HABILITADO 2026-07-03 (evidencia de bug real) ─────
+                        # ANÁLISIS del log de UNI/SUI (24h):
+                        #   - z llegó a 0.026 (mean reversion PERFECTA)
+                        #   - 689 mediciones con |z| < TP threshold
+                        #   - 406 zero-crossings detectados
+                        #   - Bot NUNCA cerró porque pnl_gross siempre <0 (por fees)
+                        #   - Peak equity $96.55 → actual $94.62 = perdió $1.93 por
+                        #     no cerrar en el momento de convergencia
                         #
-                        # Nueva regla: si z revirtió y estamos en pérdida bruta,
-                        # NO cerrar por TP. Mantener la posición y dejar que
-                        # gobiernen HARD_SL (pérdida monetaria absoluta) o Z_SL
-                        # (z se aleja más en contra). Si el spread vuelve a moverse
-                        # a favor, podremos cerrar como TP real cuando ok_profit pase.
-                        tp_blocked_profit_count += 1
-                        log_event({
-                            "type": "tp_blocked_loss",
-                            "trace_id": trace_id,
-                            "m1": m1, "m2": m2,
-                            "pnl_gross": pnl_gross,
-                            "net_est": net_pnl_est,
-                            "open_fees": open_fees_paid,
-                            "close_fees_est": close_fees_est,
-                            "z_now": z_now,
-                            "z_entry": z_entry,
-                            "age_hours": age_hours,
-                            "policy": "hold_until_hard_sl_or_zsl",
-                        }, print_terminal=False)
+                        # Nueva regla (smart TP_LOSS_EXIT):
+                        # Si z ha convergido claramente Y estamos en pérdida chica,
+                        # cerrar aunque sea con pérdida (mejor que dejar degradar).
+                        # Umbrales:
+                        #   - |z_now| <= threshold_dyn + 20% (convergencia clara)
+                        #   - Y pnl_gross en [-$0.75, 0] (pérdida limitada por fees+slippage)
+                        #   - Y trade lleva al menos 30 min (evita whipsaw en apertura)
+                        #
+                        # Rationale: peor caso -$0.75 << peor caso HARD_SL (-$3).
+                        # Además evita el fee bleed prolongado observado en UNI/SUI.
+                        MEAN_REVERTED_MAX_LOSS = -0.75  # aceptable pérdida chica
+                        MIN_AGE_FOR_LOSS_EXIT_MIN = 30.0
+                        age_ok = (age_min is not None and age_min >= MIN_AGE_FOR_LOSS_EXIT_MIN)
+                        loss_within_limit = (pnl_gross >= MEAN_REVERTED_MAX_LOSS)
+                        z_clearly_converged = (abs(z_now) <= _z_tp_dyn * 1.2)
+
+                        if age_ok and loss_within_limit and z_clearly_converged:
+                            is_close = True
+                            close_reason = (
+                                f"TP_MEAN_REVERTED: z={z_now:.3f} converged "
+                                f"(threshold {_z_tp_dyn:.3f}), age={age_min:.0f}min, "
+                                f"pnl_gross={pnl_gross:.3f} (accepting small loss to avoid "
+                                f"degradation - fees would have eaten breakeven)"
+                            )
+                            log_event({
+                                "type": "tp_mean_reverted",
+                                "trace_id": trace_id,
+                                "m1": m1, "m2": m2,
+                                "z_now": round(z_now, 4),
+                                "z_entry": round(z_entry, 4),
+                                "z_threshold_dyn": _z_tp_dyn,
+                                "pnl_gross": round(pnl_gross, 4),
+                                "net_est": round(net_pnl_est, 4),
+                                "age_min": round(age_min, 1) if age_min else None,
+                            })
+                        else:
+                            # No cumple criterios: HOLD hasta HARD_SL/Z_SL
+                            tp_blocked_profit_count += 1
+                            log_event({
+                                "type": "tp_blocked_loss",
+                                "trace_id": trace_id,
+                                "m1": m1, "m2": m2,
+                                "pnl_gross": round(pnl_gross, 4),
+                                "z_now": round(z_now, 4),
+                                "age_min": round(age_min, 1) if age_min else None,
+                                "gate_failed": (
+                                    "age" if not age_ok else
+                                    ("loss_too_big" if not loss_within_limit else
+                                     ("z_not_converged" if not z_clearly_converged else "unknown"))
+                                ),
+                            }, print_terminal=False)
                     else:
                         # pnl_gross > 0 but not enough to cover fees + min net profit yet.
                         # Keep waiting — the spread might improve further.

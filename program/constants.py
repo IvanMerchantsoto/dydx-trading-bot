@@ -5,13 +5,17 @@ EXIT_CHECK_SECONDS = 30       # cada cuánto evalúas exits (segundos)
 KPI_SECONDS = 600             # cada cuánto mandas KPIs (10 min)
 SESSION_SUMMARY_SECONDS = 300 # cada cuánto mandas resumen de rentabilidad de sesión (5 min)
 BATCH_OPEN_TRADES = 3         # abrir N trades y luego forzar revisión
-MAX_OPEN_TRADES = 1           # 2026-07-02: bajado de 3 a 1 mientras diagnóstico.
-                              # Bot perdió dinero overnight con 3 concurrent trades.
-                              # Restaurar a 3 solo después de confirmar que:
-                              #   1. Ningún trade cerró por HARD_SL innecesariamente
-                              #   2. TP dinámico funcionó al menos una vez
-                              #   3. CSV se regeneró como esperado
-                              # Ver bloque "2026-06-30" en git blame para restaurar.
+MAX_OPEN_TRADES = 2           # 2026-07-02 (evening): subido de 1 a 2.
+                              # Razón: UNI/SUI lleva 11h con z estancado en 1.16 sin llegar
+                              # al TP. Con MAX=1, el capital queda parado.
+                              # MAX=2 permite un segundo trade en paralelo mientras UNI/SUI
+                              # espera convergencia.
+                              # Precauciones:
+                              #  - live_markets check (chain ∪ json) evita compartir legs
+                              #  - MAX_TRADES_PER_MARKET=2 limita concentración
+                              #  - hard_sl_usd=3 por par → worst case -$6 con 2 trades
+                              # Si funciona OK 24h, considerar volver a MAX=3.
+                              # Si empeora, bajar a MAX=1.
 
 # ===== Exit rules =====
 USE_MIN_PROFIT_TP = True

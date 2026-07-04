@@ -288,7 +288,15 @@ RESOLUTION = "1HOUR"
 WINDOW = 21
 
 # Thresholds - Opening
-MAX_HALF_LIFE = 24
+# 2026-07-04: bajado de 24h → 8h. WINDOW=21 barras (1HOUR) = 21h de memoria.
+# Con MAX=24h teníamos incongruencia: half_life ≈ rolling window causa que
+# el rolling mean "camine" con el spread, produciendo FALSA CONVERGENCIA
+# (z baja pero el spread real no se mueve → PnL negativo aunque z=0).
+# Regla: WINDOW debería cubrir 3× half-life típico.
+#   Con WINDOW=21h: MAX_HALF_LIFE ≤ 7-8h para cubrir 3×.
+# Con este cambio: menos pares cointegrados pero MÁS RÁPIDOS a revertir
+# → menos tiempo esperando → menos fee bleed → menos falsa convergencia.
+MAX_HALF_LIFE = 8
                        # El exit por Z_SL y HARD_SL gestiona el riesgo de tardanza
 ZSCORE_THRESH = 2.7    # 2026-05-22: bajado de 3.0 a 2.7 tras backtest OOS comparativo.
                        #

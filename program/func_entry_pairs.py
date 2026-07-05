@@ -636,7 +636,14 @@ async def open_positions(
 
         base_quantity = eff_usd / base_price
         quote_quantity = eff_usd / quote_price
-        approx_spread_usd = spread_dev * min(base_quantity, quote_quantity)
+        # 2026-07-04 fix (Bug #3): usar base_quantity, NO min(base,quote).
+        # spread está en unidades de precio de leg 1 (porque hedge_ratio × price_2
+        # traduce a esas unidades). El edge por convergencia es spread_dev × qty_leg1.
+        # ANTES (bug): min() subestimaba cuando base_market era más barato (más
+        # quantity), forzando quote_quantity que era menor → edge subestimado
+        # → MIN_EDGE_FEE_MULTIPLE=2.0 rechazaba trades válidos → adverse selection:
+        # solo pasaban signals extremos (más propensos a ser regime breaks).
+        approx_spread_usd = spread_dev * base_quantity
 
         base_side = "BUY" if z_score < 0 else "SELL"
         quote_side = "BUY" if z_score > 0 else "SELL"

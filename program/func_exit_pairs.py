@@ -16,7 +16,7 @@ from constants import (
     SL_COOLDOWN_ENABLED, SL_COOLDOWN_MIN_HOURS, SL_COOLDOWN_HALFLIFE_MULT,
 )
 from func_utils import format_number
-from func_public import get_candles_recent
+from func_public import get_candles_recent, get_market_spread_bps
 from func_cointegration import calculate_zscore
 from func_private import place_market_order, close_pair_maker_with_fallback, get_real_fill_details
 from constants import MAKER_EXIT_ENABLED, MAKER_EXIT_TIMEOUT_S
@@ -168,33 +168,37 @@ def _profit_gate(
     notional: float,
     open_fees_paid: float = 0.0,
     close_fees_est: float = 0.0,
+    close_slippage_est: float = 0.0,
 ) -> tuple[bool, float, float]:
     """
-    Returns (passes_gate, min_required_gross, net_pnl_est).
+    Returns (passes_gate, min_required_gross, net_pnl_executable).
 
-    pnl_gross      : unrealized PnL proxy (no fees)
-    notional       : total notional of both legs (for % threshold)
-    open_fees_paid : actual fees paid at entry (from position record)
-    close_fees_est : estimated fees to close (oracle price × TAKER_FEE_BPS)
+    pnl_gross         : unrealized PnL proxy (using oracle prices, no fees)
+    notional          : total notional of both legs
+    open_fees_paid    : actual fees paid at entry
+    close_fees_est    : estimated taker fees to close
+    close_slippage_est: 2026-07-04 fix Bug #2. Estimated slippage on close.
+                        pnl_gross uses ORACLE prices, but actual close crosses
+                        the orderbook → pays bid/ask, worse than oracle by
+                        ~half-spread × 2 legs. Without accounting for this,
+                        the gate reports "profit gate pass" but real execution
+                        results in NET LOSS.
 
-    The gate requires gross PnL to exceed:
-        max(MIN_PROFIT_USD, MIN_PROFIT_PCT × notional) + total_fees
-    so that NET profit after all fees is ≥ the configured minimum.
+    The gate requires "executable" PnL (gross minus all transaction costs)
+    to exceed the target minimum profit.
     """
-    total_fees = open_fees_paid + close_fees_est
-    net_pnl = pnl_gross - total_fees
+    total_costs = open_fees_paid + close_fees_est + close_slippage_est
+    net_pnl_executable = pnl_gross - total_costs
 
     if USE_MIN_PROFIT_TP:
-        # Target net profit (before fees are added back)
         target_net = max(float(CONST_MIN_PROFIT_USD), float(CONST_MIN_PROFIT_PCT) * float(notional))
-        # Gross must cover target net + all fees
-        min_gross_required = target_net + total_fees
+        min_gross_required = target_net + total_costs
         passes = pnl_gross >= min_gross_required
-        return passes, min_gross_required, net_pnl
+        return passes, min_gross_required, net_pnl_executable
 
-    # If USE_MIN_PROFIT_TP is False: just require covering fees (break-even or better)
-    passes = net_pnl >= 0.0
-    return passes, total_fees, net_pnl
+    # If USE_MIN_PROFIT_TP is False: just require covering all costs
+    passes = net_pnl_executable >= 0.0
+    return passes, total_costs, net_pnl_executable
 
 
 def _hard_sl_level(notional: float) -> float:
@@ -517,8 +521,29 @@ async def manage_trade_exits(node, indexer, wallet):
         # True at this stage. After the close, we attempt to fetch real close fees
         # below and downgrade pnl_provisional to False if successful.
 
+        # 2026-07-04 fix (Bug #2): estimar SLIPPAGE de close, no solo fees.
+        # pnl_gross usa precios oracle. Al cerrar, cruzamos el book → precio
+        # peor que oracle por ~half-spread por cada leg. Sin restarlo, el
+        # profit gate dice OK cuando en realidad la ejecución neta es negativa.
+        close_slippage_est = 0.0
+        try:
+            sp1_bps = await get_market_spread_bps(indexer, m1)
+            sp2_bps = await get_market_spread_bps(indexer, m2)
+            # Fallback: si no hay spread data, asume 20 bps (conservador)
+            sp1_bps = sp1_bps if sp1_bps is not None else 20.0
+            sp2_bps = sp2_bps if sp2_bps is not None else 20.0
+            # Slippage per leg = half-spread × notional
+            leg1_notional = abs(_sf(position.get("filled_usd_1", 0.0)))
+            leg2_notional = abs(_sf(position.get("filled_usd_2", 0.0)))
+            slip_1 = (sp1_bps / 2.0 / 10000.0) * leg1_notional
+            slip_2 = (sp2_bps / 2.0 / 10000.0) * leg2_notional
+            close_slippage_est = slip_1 + slip_2
+        except Exception:
+            # Fallback conservador: 15 bps combinado × notional total
+            close_slippage_est = 0.0015 * total_notional / 2.0
+
         ok_profit, min_gross_required, net_pnl_est = _profit_gate(
-            pnl_gross, total_notional, open_fees_paid, close_fees_est
+            pnl_gross, total_notional, open_fees_paid, close_fees_est, close_slippage_est
         )
 
         is_close = False

@@ -135,17 +135,28 @@ def calculate_cointegration(series_1, series_2):
         p_value = coint_res[1]
         critical_value = coint_res[2][1]
 
-        # Hedge ratio via OLS without intercept: hr ≈ mean(s1)/mean(s2).
-        # This is intentional for z-score pairs trading — the spread
-        # s1 - hr*s2 oscillates near zero, producing meaningful half-lives
-        # and z-scores. Adding an intercept shifts the β to a "true" OLS
-        # slope but produces spreads with longer dynamics that break the
-        # half-life filter and don't improve signal quality for this strategy.
-        model = sm.OLS(series_1, series_2).fit()
-        hedge_ratio = model.params[0]
+        # 2026-07-04 fix (Bug #1): Hedge ratio via OLS WITH INTERCEPT.
+        # Antes se usaba sm.OLS(s1, s2) sin add_constant, forzando la línea
+        # a pasar por el origen. Para series de precios positivos (BTC, ETH,
+        # LDO, etc.), esto colapsa a hedge_ratio ≈ mean(s1)/mean(s2) —
+        # ratio de medias, NO el β real de OLS. El spread resultante NO
+        # está centrado en cero, sesgando el z-score sistemáticamente.
+        #
+        # Con intercept: model = a + β·s2 + ε
+        # - hedge_ratio = β (slope real) — el ratio market-neutral verdadero
+        # - intercept a captura el nivel del spread → spread residual
+        #   centrado en cero por construcción → z-score matemáticamente válido
+        #
+        # Los pares tradeados equal-dollar (bug related): esto no lo arregla,
+        # pero al menos la señal ahora usa la relación correcta.
+        X_with_const = sm.add_constant(series_2)
+        model = sm.OLS(series_1, X_with_const).fit()
+        intercept = model.params[0]
+        hedge_ratio = model.params[1]
         r_squared = float(model.rsquared)
 
-        spread = series_1 - (hedge_ratio * series_2)
+        # Spread ahora es RESIDUAL de la regresión (mean-zero por construcción)
+        spread = series_1 - (hedge_ratio * series_2) - intercept
         half_life = calculate_half_life(spread)
         t_check = coint_t < critical_value
         coint_flag = 1 if p_value < 0.05 and t_check else 0

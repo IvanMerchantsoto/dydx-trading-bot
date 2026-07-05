@@ -179,6 +179,7 @@ def store_cointegration_results(df_market_prices):
     n_hl_too_long = 0      # half_life > MAX_HALF_LIFE
     n_hedge_filtered = 0   # hedge ratio outside [10^-LOG_MAX, 10^LOG_MAX]
     n_hurst_filtered = 0   # Hurst exponent >= HURST_MAX (spread is trending)
+    n_r2_filtered = 0      # 2026-07-04: r_squared < 0.75 (relación lineal débil)
     half_lives_seen = []   # collect all valid half-lives for distribution
     hurst_values_seen = [] # for distribution diagnostic
     r_squared_seen = []    # R² distribution of hedge ratio OLS fits
@@ -238,6 +239,21 @@ def store_cointegration_results(df_market_prices):
                             n_hurst_filtered += 1
                             continue
 
+                    # ── Filter 4: R² quality (2026-07-04 Bug #4 fix) ────────
+                    # Con OLS+intercept (correcto), r² revela la calidad REAL
+                    # de la relación lineal. Antes con OLS sin intercept, r²
+                    # era artificialmente alto (~0.99) para casi cualquier par
+                    # positivo. Ahora r² es honesto: la mediana bajó a ~0.32.
+                    #
+                    # Con r² bajo, el spread tiene mucho ruido relativo a
+                    # su magnitud → z-score inestable → mean reversion débil.
+                    # Con $30/leg y fees + slippage ~$0.15, necesitamos pares
+                    # con relación fuerte (r² >= 0.75) para que la señal
+                    # supere el ruido.
+                    if r_sq < 0.75:
+                        n_r2_filtered += 1
+                        continue
+
                     # ── Passes all filters ──────────────────────────────────
                     # 2026-07-01: compute per-pair z-score distribution to
                     # derive DYNAMIC entry/exit thresholds. Instead of using
@@ -295,6 +311,7 @@ def store_cointegration_results(df_market_prices):
     print(f"  → HL > {MAX_HALF_LIFE}h (slow):      {n_hl_too_long}")
     print(f"  → Hedge ratio extreme:     {n_hedge_filtered}  (|log10(hr)| > {HEDGE_RATIO_LOG_MAX})")
     print(f"  → Hurst ≥ {HURST_MAX} (trending): {n_hurst_filtered}")
+    print(f"  → R² < 0.75 (weak fit):    {n_r2_filtered}")
     print(f"  → Passed ALL filters ✓:    {n_pairs_found}")
     if half_lives_seen:
         arr = np.array(half_lives_seen)

@@ -539,8 +539,10 @@ async def manage_trade_exits(node, indexer, wallet):
             slip_2 = (sp2_bps / 2.0 / 10000.0) * leg2_notional
             close_slippage_est = slip_1 + slip_2
         except Exception:
-            # Fallback conservador: 15 bps combinado × notional total
-            close_slippage_est = 0.0015 * total_notional / 2.0
+            # 2026-07-05 code-review fix: quitar el /2.0 espurio.
+            # Fallback conservador: 20 bps × notional total (equivalente a
+            # ~10 bps half-spread por cada leg, similar al path normal).
+            close_slippage_est = 0.0020 * total_notional
 
         ok_profit, min_gross_required, net_pnl_est = _profit_gate(
             pnl_gross, total_notional, open_fees_paid, close_fees_est, close_slippage_est

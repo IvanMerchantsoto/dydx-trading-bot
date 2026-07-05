@@ -230,6 +230,13 @@ def store_cointegration_results(df_market_prices):
                     #   random walk   → H_diff≈0.579  (rechazado si ≥ HURST_MAX=0.52)
                     s1_arr = np.array(series_1, dtype=float)
                     s2_arr = np.array(series_2, dtype=float)
+                    # 2026-07-05 code-review note: intercept NO se propaga acá
+                    # (no está en scope, calculate_cointegration no lo retorna).
+                    # Matemáticamente OK porque:
+                    #   - np.diff() cancela cualquier constante → hurst invariante
+                    #   - z-score via rolling mean cancela constante → thresholds invariantes
+                    # Aunque este spread está "shifted" por intercept vs el spread real
+                    # centrado, todas las métricas derivadas son invariantes al offset.
                     spread_arr = s1_arr - (hedge_ratio * s2_arr)
                     hurst = calculate_hurst_exponent(np.diff(spread_arr))
 

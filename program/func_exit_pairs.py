@@ -641,7 +641,10 @@ async def manage_trade_exits(node, indexer, wallet):
                     # chica Y trade tiene edad razonable, cerrar. La política vieja
                     # de "HOLD hasta HARD_SL/Z_SL" hacía perder MUCHO más ($1.93 en
                     # UNI/SUI observado) que cerrar en el momento de convergencia.
-                    MEAN_REVERTED_MAX_LOSS_ZC = -0.75
+                    # 2026-07-06: escalado con equity $641 y sizing $65/leg.
+                    # Antes $60 notional → -$0.75 (~1.25% loss).
+                    # Ahora $130 notional → -$1.60 (~1.25% loss, mismo % relativo).
+                    MEAN_REVERTED_MAX_LOSS_ZC = -1.60
                     MIN_AGE_FOR_ZC_LOSS_EXIT_MIN = 30.0
                     age_ok = (age_min is not None and age_min >= MIN_AGE_FOR_ZC_LOSS_EXIT_MIN)
                     loss_ok = (pnl_gross >= MEAN_REVERTED_MAX_LOSS_ZC)
@@ -789,7 +792,9 @@ async def manage_trade_exits(node, indexer, wallet):
                         #
                         # Rationale: peor caso -$0.75 << peor caso HARD_SL (-$3).
                         # Además evita el fee bleed prolongado observado en UNI/SUI.
-                        MEAN_REVERTED_MAX_LOSS = -0.75  # aceptable pérdida chica
+                        # 2026-07-06: escalado con equity $641 y sizing $65/leg.
+                        # ~1.25% del notional (mismo % relativo que antes con $60).
+                        MEAN_REVERTED_MAX_LOSS = -1.60  # aceptable pérdida chica
                         MIN_AGE_FOR_LOSS_EXIT_MIN = 30.0
                         MIN_SPREAD_REVERSION = 0.5  # spread absoluto debe haber convergido >=50%
                         age_ok = (age_min is not None and age_min >= MIN_AGE_FOR_LOSS_EXIT_MIN)

@@ -5,18 +5,18 @@ EXIT_CHECK_SECONDS = 30       # cada cuánto evalúas exits (segundos)
 KPI_SECONDS = 600             # cada cuánto mandas KPIs (10 min)
 SESSION_SUMMARY_SECONDS = 300 # cada cuánto mandas resumen de rentabilidad de sesión (5 min)
 BATCH_OPEN_TRADES = 3         # abrir N trades y luego forzar revisión
-MAX_OPEN_TRADES = 3           # 2026-07-03: subido de 2 a 3.
-                              # Bot ha pasado >24h con 1 par (UNI/SUI) sin cerrar,
-                              # perdiendo oportunidades. Con MAX=3 puede rotar
-                              # capital en varios pares mientras uno se estanca.
-                              # Ya no es la primera vez con MAX=3 — los fixes de
-                              # correlación y pre-flight mitigan el problema
-                              # original de anoche.
+MAX_OPEN_TRADES = 5           # 2026-07-06: subido de 3 a 5 con equity $641.
+                              # Estrategia diversificación: 5 pares × $65/leg =
+                              # $650 notional (~igual al de 3×$100), pero:
+                              #   - Variance portfolio: 33% → 20%
+                              #   - Sharpe esperado sube
+                              #   - Ley de grandes números favorece más pares
                               # Precauciones activas:
-                              #  - live_markets check (chain ∪ json)
-                              #  - MAX_TRADES_PER_MARKET=2 (concentración)
-                              #  - HARD_SL $3 por par → worst case -$9 con 3
-                              #  - Pre-flight edge/ceiling check
+                              #   - MAX_TRADES_PER_MARKET=2 (concentración)
+                              #   - HARD_SL $8 por par → worst case -$40 con 5
+                              #     (aún manejable, 6% del equity total)
+                              #   - Pre-flight edge/ceiling check
+                              # Si va bien 2 semanas, considerar subir a 6-8.
 
 # ===== Exit rules =====
 USE_MIN_PROFIT_TP = True
@@ -27,7 +27,9 @@ USE_MIN_PROFIT_TP = True
 # Con notional combinado ~$60, MIN_PROFIT_PCT=0.0025 → $0.15 net mínimo.
 # Más bajo que esto significa cerrar trades por puro ruido.
 MIN_PROFIT_PCT = 0.0025   # 0.25% del notional como ganancia neta mínima
-MIN_PROFIT_USD = 0.10     # o al menos $0.10 neto — lo que sea mayor
+# 2026-07-06: subido de $0.10 a $0.30 con equity $641 y sizing $65/leg.
+# Notional/pair = $130, 0.25% × $130 = $0.325 → nuevo piso $0.30.
+MIN_PROFIT_USD = 0.30
 # Con $1000/leg ($2000 notional), fees round-trip ≈ $2.00:
 #   min_gross_required = fees + max($0.50, $2000×0.025%) = $2 + $0.50 = $2.50
 # Antes: MIN_PROFIT_PCT=0.15% → PCT gate=$3.00 → min_gross=$5.00
@@ -108,8 +110,11 @@ RISK_SCORE_W_UNREAL_PNL = 0.15  # $1 de pérdida ≈ 0.15 puntos de score
 # $3 USD = 3% del equity total = stop loss tolerable por trade individual.
 # Sobre $60 notional combinado: 3/60 = 5% → razonable.
 # Cuando subas a $500 equity: subir a $10. A $5,000: $20.
-HARD_SL_USD = 3.0
-HARD_SL_PCT = 0.05            # 5% del notional combinado
+HARD_SL_USD = 8.0             # 2026-07-06: 3 → 8 con equity $641 y sizing $65/leg.
+                              # Notional pair = $130. 5% × $130 = $6.5.
+                              # $8 es piso absoluto (max de HARD_SL_PCT × notional y USD).
+                              # Worst case con 5 pares: -$40 (6% del equity total).
+HARD_SL_PCT = 0.05            # 5% del notional combinado (efectivo si notional > $160)
 
 # SELECT MODE
 # 2026-05-26: cambiado a PRODUCTION para operar $100 USD en mainnet.
@@ -168,9 +173,17 @@ MIN_EDGE_FEE_MULTIPLE = 2.0
 #   30% × $500 = $150/leg, max_open hasta 2 pairs
 #   (subir DYNAMIC_SIZING_PCT a 0.20 cuando equity > $300 para diversificar)
 DYNAMIC_SIZING = True
-DYNAMIC_SIZING_PCT = 0.30         # 30% of equity per leg
-DYNAMIC_SIZING_MIN_USD = 20.0     # floor: $20/leg (límite práctico mainnet)
-DYNAMIC_SIZING_MAX_USD = 50.0     # cap:   $50/leg (limita tamaño hasta validar)
+# 2026-07-06: Escalado a equity $641 (post-depósito $550) con enfoque
+# DIVERSIFICACIÓN. En vez de 3 pares grandes ($100/leg), usamos 5 pares
+# más chicos ($65/leg). Mismo notional total (~$650) pero:
+#   - Variance del portfolio: 33% → 20% (40% menos drawdown esperado)
+#   - Más "at bats" → convergencia estadística más rápida
+#   - Mejor Sharpe ratio esperado
+#   - Cada trade contribuye menos al riesgo total
+# Ratio fees/edge se mantiene igual (escalan juntos).
+DYNAMIC_SIZING_PCT = 0.10         # 10% of equity per leg  → $64 con $641
+DYNAMIC_SIZING_MIN_USD = 40.0     # floor: $40/leg
+DYNAMIC_SIZING_MAX_USD = 80.0     # cap:   $80/leg (redondeo step $8)
 # Cuando subas a $500 de equity y quieras escalar:
 #   DYNAMIC_SIZING_PCT = 0.20
 #   DYNAMIC_SIZING_MIN_USD = 50.0
@@ -314,8 +327,8 @@ ZSCORE_THRESH = 2.7    # 2026-05-22: bajado de 3.0 a 2.7 tras backtest OOS compa
                        # Trade marginal entre 2.7→2.5 baja a EV=$9.79 con PF degradando — no vale el churn.
                        # ZSCORE_THRESH anterior fijo en 3.0 capturaba solo 8% de escaneos vs ~20% con 2.7
                        # (en log del bot 2026-05-19/22). 2.5× más oportunidades, mismo nivel de calidad.
-USD_PER_TRADE = 30           # 2026-05-26: fallback if dynamic sizing fails. $30/leg.
-USD_MIN_COLLATERAL = 30      # 2026-05-26: Bot puede operar hasta que collateral baje a $30.
+USD_PER_TRADE = 65           # 2026-07-06: fallback si dynamic falla. $65/leg (config $641 equity).
+USD_MIN_COLLATERAL = 70      # 2026-07-06: subido a $70 (~1.1× sizing). Bot pausa si free < $70.
                               # Con $100 equity, deja $70 de buffer para variaciones.
                               # Cuando subas equity a $500+: subir a $150.
 

@@ -597,13 +597,22 @@ async def manage_trade_exits(node, indexer, wallet):
                 (z_entry < -0.1 and z_now >  0.1)
             )
             if zero_crossed:
-                if can_pnl and pnl_gross > 0 and ok_profit:
+                # 2026-07-06 fix (Bug B): en zero-crossing, la thesis de
+                # mean-reversion se cumplió COMPLETAMENTE. Usar gate más
+                # relajado: aceptar cualquier net_pnl > 0 (post costs),
+                # no requiere alcanzar MIN_PROFIT normal.
+                # Caso real: ATOM/TAO 11 events blocked con
+                #   pnl_gross=$0.23-0.26, net_est=+$0.05 a +$0.09.
+                # Todo era profit real post-costs pero gate estricto lo bloqueaba.
+                zc_net_positive = can_pnl and (net_pnl_est is not None) and (net_pnl_est > 0)
+                if zc_net_positive:
                     is_close = True
                     close_reason = (
                         f"TP_CROSSED_ZERO: z_entry={z_entry:.3f} → z_now={z_now:.3f} "
-                        f"(spread overshot mean) "
+                        f"(mean fully reverted) "
                         f"| pnl_gross={pnl_gross:.2f} | net_est={net_pnl_est:.2f} "
-                        f"| min_gross={min_gross_required:.2f}"
+                        f"| min_gross_normal={min_gross_required:.2f} "
+                        f"(zero-crossing bypasses strict gate)"
                     )
                     log_event({
                         "type": "tp_zero_crossing_trigger",
@@ -613,8 +622,9 @@ async def manage_trade_exits(node, indexer, wallet):
                         "z_now": round(z_now, 4),
                         "pnl_gross": round(pnl_gross, 4),
                         "net_est": round(net_pnl_est, 4),
+                        "gate_used": "relaxed_net_positive",
                     })
-                elif can_pnl and pnl_gross > 0 and not ok_profit:
+                elif can_pnl and pnl_gross > 0 and not zc_net_positive:
                     # Cruzó pero profit aún no cubre fees + min — esperar más
                     log_event({
                         "type": "tp_zero_crossing_blocked_profit",

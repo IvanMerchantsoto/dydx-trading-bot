@@ -1013,6 +1013,18 @@ async def open_positions(
             bot_open_dict["pair_status"] = "ORPHAN"
             bot_open_dict["needs_reconcile"] = True
             bot_open_dict["opened_at"] = bot_open_dict.get("opened_at") or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+            # 2026-07-06 debug fix (Bug A): guardar TAMBIÉN los campos de PnL
+            # aquí. Antes solo se guardaban en el path LIVE, así que si un par
+            # se marcaba ORPHAN (por race condition indexer) y después se
+            # recuperaba a LIVE (manual o auto), _has_pnl_fields() retornaba
+            # False → can_pnl=False → todos los TP gates bloqueados → zombie.
+            # Caso real: UNI/SUI 69h abierto con tp_confirm=584 sin cerrar.
+            bot_open_dict["side_1"] = bot_open_dict.get("side_1") or base_side
+            bot_open_dict["side_2"] = bot_open_dict.get("side_2") or quote_side
+            bot_open_dict["price_1"] = bot_open_dict.get("price_1") or cand["base_price"]
+            bot_open_dict["price_2"] = bot_open_dict.get("price_2") or cand["quote_price"]
+            bot_open_dict["size_1"] = bot_open_dict.get("size_1") or _sf(bot_open_dict.get("filled_size_1"), _sf(cand["base_size_fmt"]))
+            bot_open_dict["size_2"] = bot_open_dict.get("size_2") or _sf(bot_open_dict.get("filled_size_2"), _sf(cand["quote_size_fmt"]))
             bot_agents.append(bot_open_dict)
             with open(JSON_PATH, "w") as f:
                 json.dump(bot_agents, f, indent=2)

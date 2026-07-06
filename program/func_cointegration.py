@@ -247,30 +247,32 @@ def store_cointegration_results(df_market_prices):
                             continue
 
                     # ── Filter 4: R² quality (2026-07-04 Bug #4 fix) ────────
-                    # Con OLS+intercept (correcto), r² revela la calidad REAL
-                    # de la relación lineal. Antes con OLS sin intercept, r²
-                    # era artificialmente alto (~0.99) para casi cualquier par
-                    # positivo. Ahora r² es honesto: la mediana bajó a ~0.32.
+                    # 2026-07-06 update: 0.75 → 0.70.
+                    # Con equity $641 y sizing $65/leg, notional doblado vs $60
+                    # anterior. Edge esperado también dobla. Puede tolerar
+                    # pares con r² ligeramente menor (más ruido pero suficiente
+                    # edge absoluto). p90 percentile compensa el ruido extra.
                     #
-                    # Con r² bajo, el spread tiene mucho ruido relativo a
-                    # su magnitud → z-score inestable → mean reversion débil.
-                    # Con $30/leg y fees + slippage ~$0.15, necesitamos pares
-                    # con relación fuerte (r² >= 0.75) para que la señal
-                    # supere el ruido.
-                    if r_sq < 0.75:
+                    # Expected universe: 36 pares (r²>=0.75) → ~55-70 pares
+                    # (r²>=0.70). +50-90% más candidates disponibles.
+                    if r_sq < 0.70:
                         n_r2_filtered += 1
                         continue
 
                     # ── Passes all filters ──────────────────────────────────
-                    # 2026-07-01: compute per-pair z-score distribution to
-                    # derive DYNAMIC entry/exit thresholds. Instead of using
-                    # global ZSCORE_THRESH=2.7 and Z_TP=0.7 for ALL pairs,
-                    # each pair gets thresholds based on its OWN volatility:
-                    #   z_entry_threshold = p95 of |z| history (top 5% events)
-                    #   z_exit_threshold  = p30 of |z| history (bottom 30% quiet)
+                    # 2026-07-01 / 2026-07-06: per-pair z-score thresholds.
+                    #   z_entry_threshold = p90 of |z| history (top 10% events)
+                    #   z_exit_threshold  = p30 of |z| history (bottom 30%)
                     #
-                    # Sanity limits prevent extreme values:
-                    #   entry: clamped to [2.0, 4.0]
+                    # 2026-07-06 update: p95 → p90 y clamp min 2.0 → 1.8.
+                    # Razón: con universo tight de 36 pares (post r²>=0.75),
+                    # p95 clamp min=2.0 daba ~1-2 trades/día. p90 clamp min=1.8
+                    # esperado da 2-4x más signals (top 10% vs top 5%).
+                    # Con matemática correcta (Bug #1 fix + spread_reversion),
+                    # los signals adicionales son de calidad genuina.
+                    #
+                    # Sanity limits:
+                    #   entry: clamped to [1.8, 4.0]
                     #   exit:  clamped to [0.3, 1.5]
                     try:
                         spread_series = pd.Series(spread_arr)
@@ -279,16 +281,16 @@ def store_cointegration_results(df_market_prices):
                         z_hist = (spread_series - z_hist_mean) / z_hist_std
                         z_abs = z_hist.dropna().abs().values
                         if len(z_abs) >= 20:  # need enough samples
-                            z_entry_dyn = float(np.percentile(z_abs, 95))
+                            z_entry_dyn = float(np.percentile(z_abs, 90))
                             z_exit_dyn = float(np.percentile(z_abs, 30))
                             # Clamp to safe range
-                            z_entry_dyn = max(2.0, min(4.0, z_entry_dyn))
+                            z_entry_dyn = max(1.8, min(4.0, z_entry_dyn))
                             z_exit_dyn = max(0.3, min(1.5, z_exit_dyn))
                         else:
-                            z_entry_dyn = 2.7   # fallback to global default
+                            z_entry_dyn = 2.2   # fallback (más lenient también)
                             z_exit_dyn = 0.7
                     except Exception:
-                        z_entry_dyn = 2.7
+                        z_entry_dyn = 2.2
                         z_exit_dyn = 0.7
 
                     half_lives_seen.append(half_life)

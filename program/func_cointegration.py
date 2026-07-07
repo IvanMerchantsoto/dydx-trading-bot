@@ -135,28 +135,17 @@ def calculate_cointegration(series_1, series_2):
         p_value = coint_res[1]
         critical_value = coint_res[2][1]
 
-        # 2026-07-04 fix (Bug #1): Hedge ratio via OLS WITH INTERCEPT.
-        # Antes se usaba sm.OLS(s1, s2) sin add_constant, forzando la línea
-        # a pasar por el origen. Para series de precios positivos (BTC, ETH,
-        # LDO, etc.), esto colapsa a hedge_ratio ≈ mean(s1)/mean(s2) —
-        # ratio de medias, NO el β real de OLS. El spread resultante NO
-        # está centrado en cero, sesgando el z-score sistemáticamente.
-        #
-        # Con intercept: model = a + β·s2 + ε
-        # - hedge_ratio = β (slope real) — el ratio market-neutral verdadero
-        # - intercept a captura el nivel del spread → spread residual
-        #   centrado en cero por construcción → z-score matemáticamente válido
-        #
-        # Los pares tradeados equal-dollar (bug related): esto no lo arregla,
-        # pero al menos la señal ahora usa la relación correcta.
-        X_with_const = sm.add_constant(series_2)
-        model = sm.OLS(series_1, X_with_const).fit()
-        intercept = model.params[0]
-        hedge_ratio = model.params[1]
+        # Hedge ratio via OLS without intercept: hr ≈ mean(s1)/mean(s2).
+        # This is intentional for z-score pairs trading — the spread
+        # s1 - hr*s2 oscillates near zero, producing meaningful half-lives
+        # and z-scores. Adding an intercept shifts the β to a "true" OLS
+        # slope but produces spreads with longer dynamics that break the
+        # half-life filter and don't improve signal quality for this strategy.
+        model = sm.OLS(series_1, series_2).fit()
+        hedge_ratio = model.params[0]
         r_squared = float(model.rsquared)
 
-        # Spread ahora es RESIDUAL de la regresión (mean-zero por construcción)
-        spread = series_1 - (hedge_ratio * series_2) - intercept
+        spread = series_1 - (hedge_ratio * series_2)
         half_life = calculate_half_life(spread)
         t_check = coint_t < critical_value
         coint_flag = 1 if p_value < 0.05 and t_check else 0
@@ -179,7 +168,6 @@ def store_cointegration_results(df_market_prices):
     n_hl_too_long = 0      # half_life > MAX_HALF_LIFE
     n_hedge_filtered = 0   # hedge ratio outside [10^-LOG_MAX, 10^LOG_MAX]
     n_hurst_filtered = 0   # Hurst exponent >= HURST_MAX (spread is trending)
-    n_r2_filtered = 0      # 2026-07-04: r_squared < 0.75 (relación lineal débil)
     half_lives_seen = []   # collect all valid half-lives for distribution
     hurst_values_seen = [] # for distribution diagnostic
     r_squared_seen = []    # R² distribution of hedge ratio OLS fits
@@ -230,13 +218,6 @@ def store_cointegration_results(df_market_prices):
                     #   random walk   → H_diff≈0.579  (rechazado si ≥ HURST_MAX=0.52)
                     s1_arr = np.array(series_1, dtype=float)
                     s2_arr = np.array(series_2, dtype=float)
-                    # 2026-07-05 code-review note: intercept NO se propaga acá
-                    # (no está en scope, calculate_cointegration no lo retorna).
-                    # Matemáticamente OK porque:
-                    #   - np.diff() cancela cualquier constante → hurst invariante
-                    #   - z-score via rolling mean cancela constante → thresholds invariantes
-                    # Aunque este spread está "shifted" por intercept vs el spread real
-                    # centrado, todas las métricas derivadas son invariantes al offset.
                     spread_arr = s1_arr - (hedge_ratio * s2_arr)
                     hurst = calculate_hurst_exponent(np.diff(spread_arr))
 
@@ -246,59 +227,7 @@ def store_cointegration_results(df_market_prices):
                             n_hurst_filtered += 1
                             continue
 
-                    # ── Filter 4: R² quality (2026-07-04 Bug #4 fix) ────────
-                    # 2026-07-06 update: 0.75 → 0.70.
-                    # Con equity $641 y sizing $65/leg, notional doblado vs $60
-                    # anterior. Edge esperado también dobla. Puede tolerar
-                    # pares con r² ligeramente menor (más ruido pero suficiente
-                    # edge absoluto). p90 percentile compensa el ruido extra.
-                    #
-                    # Expected universe: 36 pares (r²>=0.75) → ~55-70 pares
-                    # (r²>=0.70). +50-90% más candidates disponibles.
-                    if r_sq < 0.70:
-                        n_r2_filtered += 1
-                        continue
-
                     # ── Passes all filters ──────────────────────────────────
-                    # 2026-07-01 / 2026-07-06: per-pair z-score thresholds.
-                    #   z_entry_threshold = p90 of |z| history (top 10% events)
-                    #   z_exit_threshold  = p30 of |z| history (bottom 30%)
-                    #
-                    # 2026-07-06 update: p95 → p90 y clamp min 2.0 → 1.8.
-                    # Razón: con universo tight de 36 pares (post r²>=0.75),
-                    # p95 clamp min=2.0 daba ~1-2 trades/día. p90 clamp min=1.8
-                    # esperado da 2-4x más signals (top 10% vs top 5%).
-                    # Con matemática correcta (Bug #1 fix + spread_reversion),
-                    # los signals adicionales son de calidad genuina.
-                    #
-                    # Sanity limits:
-                    #   entry: clamped to [1.8, 4.0]
-                    #   exit:  clamped to [0.7, 1.5]  (2026-07-07 fix Bug #3: 0.3→0.7)
-                    try:
-                        spread_series = pd.Series(spread_arr)
-                        z_hist_mean = spread_series.rolling(window=WINDOW).mean()
-                        z_hist_std = spread_series.rolling(window=WINDOW).std()
-                        z_hist = (spread_series - z_hist_mean) / z_hist_std
-                        z_abs = z_hist.dropna().abs().values
-                        if len(z_abs) >= 20:  # need enough samples
-                            z_entry_dyn = float(np.percentile(z_abs, 90))
-                            z_exit_dyn = float(np.percentile(z_abs, 30))
-                            # Clamp to safe range
-                            # 2026-07-07 fix (Bug #3): floor de z_exit subido
-                            # de 0.3 → 0.7. Con 0.3, muchos pares NUNCA cerraban
-                            # por TP porque exigía convergencia extrema (z<0.3).
-                            # 0.7 es el valor que usaba junio 30 (rentable).
-                            # Facilita cierre en profit cuando spread revierte
-                            # razonablemente (no necesita ir hasta z=0).
-                            z_entry_dyn = max(1.8, min(4.0, z_entry_dyn))
-                            z_exit_dyn = max(0.7, min(1.5, z_exit_dyn))
-                        else:
-                            z_entry_dyn = 2.2   # fallback (más lenient también)
-                            z_exit_dyn = 0.7
-                    except Exception:
-                        z_entry_dyn = 2.2
-                        z_exit_dyn = 0.7
-
                     half_lives_seen.append(half_life)
                     criteria_met_pairs.append({
                         "base_market": base_market,
@@ -307,9 +236,6 @@ def store_cointegration_results(df_market_prices):
                         "half_life": half_life,
                         "hurst": round(hurst, 3) if not np.isnan(hurst) else None,
                         "r_squared": round(r_sq, 4) if not np.isnan(r_sq) else None,
-                        # 2026-07-01: dynamic thresholds per-pair
-                        "z_entry_threshold": round(z_entry_dyn, 3),
-                        "z_exit_threshold":  round(z_exit_dyn, 3),
                     })
 
             except Exception as e:
@@ -326,7 +252,6 @@ def store_cointegration_results(df_market_prices):
     print(f"  → HL > {MAX_HALF_LIFE}h (slow):      {n_hl_too_long}")
     print(f"  → Hedge ratio extreme:     {n_hedge_filtered}  (|log10(hr)| > {HEDGE_RATIO_LOG_MAX})")
     print(f"  → Hurst ≥ {HURST_MAX} (trending): {n_hurst_filtered}")
-    print(f"  → R² < 0.75 (weak fit):    {n_r2_filtered}")
     print(f"  → Passed ALL filters ✓:    {n_pairs_found}")
     if half_lives_seen:
         arr = np.array(half_lives_seen)
@@ -359,9 +284,8 @@ def store_cointegration_results(df_market_prices):
     if not df_criteria_met.empty:
         df_criteria_met.sort_values("half_life", ascending=True, inplace=True)
         df_criteria_met.reset_index(drop=True, inplace=True)
-        # Ensure column order (new columns optional for backwards compat)
-        cols = ["base_market", "quote_market", "hedge_ratio", "half_life",
-                "hurst", "r_squared", "z_entry_threshold", "z_exit_threshold"]
+        # Ensure column order (hurst optional — old CSVs won't have it)
+        cols = ["base_market", "quote_market", "hedge_ratio", "half_life", "hurst", "r_squared"]
         cols = [c for c in cols if c in df_criteria_met.columns]
         df_criteria_met = df_criteria_met[cols]
     df_criteria_met.to_csv(CSV_PATH, index=True)

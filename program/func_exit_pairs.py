@@ -16,7 +16,7 @@ from constants import (
     SL_COOLDOWN_ENABLED, SL_COOLDOWN_MIN_HOURS, SL_COOLDOWN_HALFLIFE_MULT,
 )
 from func_utils import format_number
-from func_public import get_candles_recent, get_market_spread_bps
+from func_public import get_candles_recent
 from func_cointegration import calculate_zscore
 from func_private import place_market_order, close_pair_maker_with_fallback, get_real_fill_details
 from constants import MAKER_EXIT_ENABLED, MAKER_EXIT_TIMEOUT_S
@@ -168,37 +168,33 @@ def _profit_gate(
     notional: float,
     open_fees_paid: float = 0.0,
     close_fees_est: float = 0.0,
-    close_slippage_est: float = 0.0,
 ) -> tuple[bool, float, float]:
     """
-    Returns (passes_gate, min_required_gross, net_pnl_executable).
+    Returns (passes_gate, min_required_gross, net_pnl_est).
 
-    pnl_gross         : unrealized PnL proxy (using oracle prices, no fees)
-    notional          : total notional of both legs
-    open_fees_paid    : actual fees paid at entry
-    close_fees_est    : estimated taker fees to close
-    close_slippage_est: 2026-07-04 fix Bug #2. Estimated slippage on close.
-                        pnl_gross uses ORACLE prices, but actual close crosses
-                        the orderbook → pays bid/ask, worse than oracle by
-                        ~half-spread × 2 legs. Without accounting for this,
-                        the gate reports "profit gate pass" but real execution
-                        results in NET LOSS.
+    pnl_gross      : unrealized PnL proxy (no fees)
+    notional       : total notional of both legs (for % threshold)
+    open_fees_paid : actual fees paid at entry (from position record)
+    close_fees_est : estimated fees to close (oracle price × TAKER_FEE_BPS)
 
-    The gate requires "executable" PnL (gross minus all transaction costs)
-    to exceed the target minimum profit.
+    The gate requires gross PnL to exceed:
+        max(MIN_PROFIT_USD, MIN_PROFIT_PCT × notional) + total_fees
+    so that NET profit after all fees is ≥ the configured minimum.
     """
-    total_costs = open_fees_paid + close_fees_est + close_slippage_est
-    net_pnl_executable = pnl_gross - total_costs
+    total_fees = open_fees_paid + close_fees_est
+    net_pnl = pnl_gross - total_fees
 
     if USE_MIN_PROFIT_TP:
+        # Target net profit (before fees are added back)
         target_net = max(float(CONST_MIN_PROFIT_USD), float(CONST_MIN_PROFIT_PCT) * float(notional))
-        min_gross_required = target_net + total_costs
+        # Gross must cover target net + all fees
+        min_gross_required = target_net + total_fees
         passes = pnl_gross >= min_gross_required
-        return passes, min_gross_required, net_pnl_executable
+        return passes, min_gross_required, net_pnl
 
-    # If USE_MIN_PROFIT_TP is False: just require covering all costs
-    passes = net_pnl_executable >= 0.0
-    return passes, total_costs, net_pnl_executable
+    # If USE_MIN_PROFIT_TP is False: just require covering fees (break-even or better)
+    passes = net_pnl >= 0.0
+    return passes, total_fees, net_pnl
 
 
 def _hard_sl_level(notional: float) -> float:
@@ -390,9 +386,8 @@ async def manage_trade_exits(node, indexer, wallet):
             age_min = (now_utc - opened_at).total_seconds() / 60.0
             age_hours = (now_utc - opened_at).total_seconds() / 3600.0
 
-        # Current z-score + absolute spread (for false-convergence detection)
+        # Current z-score
         z_now = None
-        spread_now = None  # 2026-07-03: valor absoluto del spread ahora
         _z_skip_reason = None
         try:
             series_1 = await get_candles_recent(indexer, m1)
@@ -440,15 +435,12 @@ async def manage_trade_exits(node, indexer, wallet):
                     # Only when z_now is valid (not on error paths).
                     if z_now is not None:
                         spread_mean = float(np.nanmean(spread))
-                        # 2026-07-03: absolute spread value for false-convergence detection
-                        spread_now = float(spread[-1]) if len(spread) > 0 else None
                         log_event({
                             "type": "zscore_live",
                             "trace_id": trace_id,
                             "m1": m1, "m2": m2,
                             "z_now": round(z_now, 4),
                             "z_entry": round(z_entry, 4),
-                            "spread_now": round(spread_now, 6) if spread_now is not None else None,
                             "spread_mean": round(spread_mean, 6),
                             "spread_std": round(spread_std, 6),
                             "n_bars": n,
@@ -521,31 +513,8 @@ async def manage_trade_exits(node, indexer, wallet):
         # True at this stage. After the close, we attempt to fetch real close fees
         # below and downgrade pnl_provisional to False if successful.
 
-        # 2026-07-04 fix (Bug #2): estimar SLIPPAGE de close, no solo fees.
-        # pnl_gross usa precios oracle. Al cerrar, cruzamos el book → precio
-        # peor que oracle por ~half-spread por cada leg. Sin restarlo, el
-        # profit gate dice OK cuando en realidad la ejecución neta es negativa.
-        close_slippage_est = 0.0
-        try:
-            sp1_bps = await get_market_spread_bps(indexer, m1)
-            sp2_bps = await get_market_spread_bps(indexer, m2)
-            # Fallback: si no hay spread data, asume 20 bps (conservador)
-            sp1_bps = sp1_bps if sp1_bps is not None else 20.0
-            sp2_bps = sp2_bps if sp2_bps is not None else 20.0
-            # Slippage per leg = half-spread × notional
-            leg1_notional = abs(_sf(position.get("filled_usd_1", 0.0)))
-            leg2_notional = abs(_sf(position.get("filled_usd_2", 0.0)))
-            slip_1 = (sp1_bps / 2.0 / 10000.0) * leg1_notional
-            slip_2 = (sp2_bps / 2.0 / 10000.0) * leg2_notional
-            close_slippage_est = slip_1 + slip_2
-        except Exception:
-            # 2026-07-05 code-review fix: quitar el /2.0 espurio.
-            # Fallback conservador: 20 bps × notional total (equivalente a
-            # ~10 bps half-spread por cada leg, similar al path normal).
-            close_slippage_est = 0.0020 * total_notional
-
         ok_profit, min_gross_required, net_pnl_est = _profit_gate(
-            pnl_gross, total_notional, open_fees_paid, close_fees_est, close_slippage_est
+            pnl_gross, total_notional, open_fees_paid, close_fees_est
         )
 
         is_close = False
@@ -597,22 +566,13 @@ async def manage_trade_exits(node, indexer, wallet):
                 (z_entry < -0.1 and z_now >  0.1)
             )
             if zero_crossed:
-                # 2026-07-06 fix (Bug B): en zero-crossing, la thesis de
-                # mean-reversion se cumplió COMPLETAMENTE. Usar gate más
-                # relajado: aceptar cualquier net_pnl > 0 (post costs),
-                # no requiere alcanzar MIN_PROFIT normal.
-                # Caso real: ATOM/TAO 11 events blocked con
-                #   pnl_gross=$0.23-0.26, net_est=+$0.05 a +$0.09.
-                # Todo era profit real post-costs pero gate estricto lo bloqueaba.
-                zc_net_positive = can_pnl and (net_pnl_est is not None) and (net_pnl_est > 0)
-                if zc_net_positive:
+                if can_pnl and pnl_gross > 0 and ok_profit:
                     is_close = True
                     close_reason = (
                         f"TP_CROSSED_ZERO: z_entry={z_entry:.3f} → z_now={z_now:.3f} "
-                        f"(mean fully reverted) "
+                        f"(spread overshot mean) "
                         f"| pnl_gross={pnl_gross:.2f} | net_est={net_pnl_est:.2f} "
-                        f"| min_gross_normal={min_gross_required:.2f} "
-                        f"(zero-crossing bypasses strict gate)"
+                        f"| min_gross={min_gross_required:.2f}"
                     )
                     log_event({
                         "type": "tp_zero_crossing_trigger",
@@ -622,9 +582,8 @@ async def manage_trade_exits(node, indexer, wallet):
                         "z_now": round(z_now, 4),
                         "pnl_gross": round(pnl_gross, 4),
                         "net_est": round(net_pnl_est, 4),
-                        "gate_used": "relaxed_net_positive",
                     })
-                elif can_pnl and pnl_gross > 0 and not zc_net_positive:
+                elif can_pnl and pnl_gross > 0 and not ok_profit:
                     # Cruzó pero profit aún no cubre fees + min — esperar más
                     log_event({
                         "type": "tp_zero_crossing_blocked_profit",
@@ -637,64 +596,27 @@ async def manage_trade_exits(node, indexer, wallet):
                         "min_required": round(min_gross_required, 4),
                     }, print_terminal=False)
                 elif can_pnl and pnl_gross <= 0:
-                    # 2026-07-03 fix: no HOLD ciego. Si zero-crossing con pérdida
-                    # chica Y trade tiene edad razonable, cerrar. La política vieja
-                    # de "HOLD hasta HARD_SL/Z_SL" hacía perder MUCHO más ($1.93 en
-                    # UNI/SUI observado) que cerrar en el momento de convergencia.
-                    # 2026-07-06: escalado con equity $641 y sizing $65/leg.
-                    # Antes $60 notional → -$0.75 (~1.25% loss).
-                    # Ahora $130 notional → -$1.60 (~1.25% loss, mismo % relativo).
-                    # 2026-07-07 fix (Bug #2): AJUSTADO A -$0.30 igual que
-                    # MEAN_REVERTED_MAX_LOSS. Ver comentario detallado en la
-                    # otra sección de exit_pairs.py.
-                    MEAN_REVERTED_MAX_LOSS_ZC = -0.30
-                    MIN_AGE_FOR_ZC_LOSS_EXIT_MIN = 30.0
-                    age_ok = (age_min is not None and age_min >= MIN_AGE_FOR_ZC_LOSS_EXIT_MIN)
-                    loss_ok = (pnl_gross >= MEAN_REVERTED_MAX_LOSS_ZC)
-                    if age_ok and loss_ok:
-                        is_close = True
-                        close_reason = (
-                            f"TP_ZERO_CROSSED_SMALL_LOSS: z_entry={z_entry:.3f} → "
-                            f"z_now={z_now:.3f} (crossed mean), age={age_min:.0f}min, "
-                            f"pnl_gross={pnl_gross:.3f} (accepting -${abs(pnl_gross):.2f} "
-                            f"to avoid degradation)"
-                        )
-                        log_event({
-                            "type": "tp_zero_crossing_loss_exit",
-                            "trace_id": trace_id,
-                            "m1": m1, "m2": m2,
-                            "z_entry": round(z_entry, 4),
-                            "z_now": round(z_now, 4),
-                            "pnl_gross": round(pnl_gross, 4),
-                            "age_min": round(age_min, 1) if age_min else None,
-                        })
-                    else:
-                        log_event({
-                            "type": "tp_zero_crossing_blocked_loss",
-                            "trace_id": trace_id,
-                            "m1": m1, "m2": m2,
-                            "z_entry": round(z_entry, 4),
-                            "z_now": round(z_now, 4),
-                            "pnl_gross": round(pnl_gross, 4),
-                            "age_min": round(age_min, 1) if age_min else None,
-                            "gate_failed": ("age" if not age_ok else "loss_too_big"),
-                        }, print_terminal=False)
+                    # Cruzó pero estamos en pérdida (raro pero posible si fees>>profit)
+                    # Mantener: HARD_SL/Z_SL eventualmente lo cerrarán
+                    log_event({
+                        "type": "tp_zero_crossing_blocked_loss",
+                        "trace_id": trace_id,
+                        "m1": m1, "m2": m2,
+                        "z_entry": round(z_entry, 4),
+                        "z_now": round(z_now, 4),
+                        "pnl_gross": round(pnl_gross, 4),
+                    }, print_terminal=False)
 
         # ── 3. Take-Profit (z reversion + confirmation + fee gate) ──────────
         # Trailing TP: sigue el spread hasta su peak y cierra en el pullback.
         # Estándar: cierra cuando |z| ≤ Z_TP (umbral fijo).
         tp_zone = False
         if USE_Z_TP and (z_now is not None):
-            # 2026-07-01: DYNAMIC per-pair exit threshold.
-            # Cada par tiene su propio z_exit_threshold_dyn calculado en
-            # cointegración (p30 de |z| histórico). Fallback a Z_TP global.
-            _z_tp_dyn = float(position.get("z_exit_threshold_dyn", Z_TP) or Z_TP)
-
             if TRAIL_TP_ENABLED:
                 best_z_val = _sf(position.get("best_z", abs(z_now)))
-                # TP zone se activa cuando z ya llegó al umbral (best_z ≤ z_tp_dyn)
+                # TP zone se activa cuando z ya llegó al umbral (best_z ≤ Z_TP)
                 # Y ahora ha rebotado TRAIL_Z_PULLBACK desde su mínimo.
-                in_tp_zone = best_z_val <= _z_tp_dyn
+                in_tp_zone = best_z_val <= float(Z_TP)
                 # Floor: si z llegó muy cerca de 0, cerrar inmediatamente
                 floor_hit = best_z_val <= float(TRAIL_Z_FLOOR)
                 # Pullback: z ha subido TRAIL_Z_PULLBACK desde el mejor z
@@ -713,14 +635,13 @@ async def manage_trade_exits(node, indexer, wallet):
                     })
             elif USE_TP_HYSTERESIS:
                 prev_in_zone = bool(position.get("tp_in_zone", False))
-                if (not prev_in_zone) and abs(z_now) <= _z_tp_dyn:
+                if (not prev_in_zone) and abs(z_now) <= float(Z_TP_IN):
                     tp_zone = True
-                elif prev_in_zone and abs(z_now) <= (_z_tp_dyn + 0.15):
+                elif prev_in_zone and abs(z_now) <= float(Z_TP_OUT):
                     tp_zone = True
                 position["tp_in_zone"] = tp_zone
             else:
-                # 2026-07-01: usa el z_exit_threshold_dyn en vez del Z_TP global
-                tp_zone = abs(z_now) <= _z_tp_dyn
+                tp_zone = abs(z_now) <= float(Z_TP)
 
         tp_confirm = int(position.get("tp_confirm", 0) or 0)
 
@@ -747,7 +668,7 @@ async def manage_trade_exits(node, indexer, wallet):
                     if ok_profit:
                         is_close = True
                         close_reason = (
-                            f"TP: abs(z={z_now:.3f}) <= {_z_tp_dyn:.3f} (dyn) "
+                            f"TP: abs(z={z_now:.3f}) <= {Z_TP} "
                             f"confirms={tp_confirm} "
                             f"| pnl_gross={pnl_gross:.2f} "
                             f"| fees={open_fees_paid + close_fees_est:.2f} "
@@ -755,110 +676,31 @@ async def manage_trade_exits(node, indexer, wallet):
                             f"| min_gross={min_gross_required:.2f}"
                         )
                     elif pnl_gross < 0.0:
-                        # ── SPREAD REVERSION CHECK (2026-07-03) ─────────────────
-                        # Antes de aceptar TP_MEAN_REVERTED con pérdida chica,
-                        # verificar que el spread absoluto REALMENTE convergió
-                        # (no que solo el z bajó por shift del rolling mean).
+                        # ── DISABLED 2026-05-21 (Bug #1 fix) ──────────────────
+                        # Antiguo TP_LOSS_EXIT: cerraba pagando fees cuando z revirtió
+                        # pero gross_pnl<0. Análisis del log 2026-05-20/22 mostró que
+                        # 9 de 14 cierres siguieron esta rama y todos terminaron con
+                        # net_pnl_est entre -$1 y -$2 (fees comieron el casi-empate).
                         #
-                        # spread_reversion_ratio:
-                        #   0.0 = spread no se movió del entry
-                        #   1.0 = spread llegó al mean original (100% conv)
-                        #   >1.0 = spread cruzó el mean (overshoot)
-                        #   <0.0 = spread se alejó más (divergió)
-                        spread_reversion_ratio = None
-                        try:
-                            s_entry = float(position.get("spread_at_entry", 0.0) or 0.0)
-                            m_entry = float(position.get("mean_at_entry", 0.0) or 0.0)
-                            distance_entry = s_entry - m_entry
-                            if spread_now is not None and abs(distance_entry) > 1e-9:
-                                distance_now = spread_now - m_entry
-                                spread_reversion_ratio = 1.0 - (distance_now / distance_entry)
-                        except Exception:
-                            pass
-
-                        # ── RE-HABILITADO 2026-07-03 (evidencia de bug real) ─────
-                        # ANÁLISIS del log de UNI/SUI (24h):
-                        #   - z llegó a 0.026 (mean reversion PERFECTA)
-                        #   - 689 mediciones con |z| < TP threshold
-                        #   - 406 zero-crossings detectados
-                        #   - Bot NUNCA cerró porque pnl_gross siempre <0 (por fees)
-                        #   - Peak equity $96.55 → actual $94.62 = perdió $1.93 por
-                        #     no cerrar en el momento de convergencia
-                        #
-                        # Nueva regla (smart TP_LOSS_EXIT):
-                        # Si z ha convergido claramente Y estamos en pérdida chica,
-                        # cerrar aunque sea con pérdida (mejor que dejar degradar).
-                        # Umbrales:
-                        #   - |z_now| <= threshold_dyn + 20% (convergencia clara)
-                        #   - Y pnl_gross en [-$0.75, 0] (pérdida limitada por fees+slippage)
-                        #   - Y trade lleva al menos 30 min (evita whipsaw en apertura)
-                        #
-                        # Rationale: peor caso -$0.75 << peor caso HARD_SL (-$3).
-                        # Además evita el fee bleed prolongado observado en UNI/SUI.
-                        # 2026-07-06: escalado con equity $641 y sizing $65/leg.
-                        # ~1.25% del notional (mismo % relativo que antes con $60).
-                        #
-                        # 2026-07-07 fix (Bug #2): AJUSTADO A -$0.30 (breakeven).
-                        # ANÁLISIS del último día (12h, 10 trades cerrados):
-                        #   - Winrate solo 30%, avg PnL -$0.033/trade
-                        #   - Este gate estaba realizando pérdidas chicas
-                        #     sistemáticamente (-$0.30 a -$1.60) en cada
-                        #     "convergencia" del spread.
-                        #   - Junio 30 (rentable): esta rama era HOLD, no CLOSE
-                        # Nueva regla: solo cerrar en profit real (net > 0)
-                        # o breakeven duro (-$0.30). Si spread revierte pero
-                        # sigue en pérdida, HOLD hasta HARD_SL o rebote.
-                        MEAN_REVERTED_MAX_LOSS = -0.30  # solo permite quasi-breakeven
-                        MIN_AGE_FOR_LOSS_EXIT_MIN = 30.0
-                        MIN_SPREAD_REVERSION = 0.5  # spread absoluto debe haber convergido >=50%
-                        age_ok = (age_min is not None and age_min >= MIN_AGE_FOR_LOSS_EXIT_MIN)
-                        loss_within_limit = (pnl_gross >= MEAN_REVERTED_MAX_LOSS)
-                        z_clearly_converged = (abs(z_now) <= _z_tp_dyn * 1.2)
-                        # spread_reversion_ok: None (no data) → asume True (backwards-compat).
-                        # Data disponible → requiere convergencia absoluta real.
-                        spread_reversion_ok = (
-                            spread_reversion_ratio is None or
-                            spread_reversion_ratio >= MIN_SPREAD_REVERSION
-                        )
-
-                        if age_ok and loss_within_limit and z_clearly_converged and spread_reversion_ok:
-                            is_close = True
-                            close_reason = (
-                                f"TP_MEAN_REVERTED: z={z_now:.3f} converged "
-                                f"(threshold {_z_tp_dyn:.3f}), spread_rev={spread_reversion_ratio}, "
-                                f"age={age_min:.0f}min, pnl_gross={pnl_gross:.3f} "
-                                f"(accepting small loss)"
-                            )
-                            log_event({
-                                "type": "tp_mean_reverted",
-                                "trace_id": trace_id,
-                                "m1": m1, "m2": m2,
-                                "z_now": round(z_now, 4),
-                                "z_entry": round(z_entry, 4),
-                                "z_threshold_dyn": _z_tp_dyn,
-                                "spread_reversion_ratio": round(spread_reversion_ratio, 3) if spread_reversion_ratio is not None else None,
-                                "pnl_gross": round(pnl_gross, 4),
-                                "net_est": round(net_pnl_est, 4),
-                                "age_min": round(age_min, 1) if age_min else None,
-                            })
-                        else:
-                            # No cumple criterios: HOLD hasta HARD_SL/Z_SL
-                            tp_blocked_profit_count += 1
-                            log_event({
-                                "type": "tp_blocked_loss",
-                                "trace_id": trace_id,
-                                "m1": m1, "m2": m2,
-                                "pnl_gross": round(pnl_gross, 4),
-                                "z_now": round(z_now, 4),
-                                "spread_reversion_ratio": round(spread_reversion_ratio, 3) if spread_reversion_ratio is not None else None,
-                                "age_min": round(age_min, 1) if age_min else None,
-                                "gate_failed": (
-                                    "age" if not age_ok else
-                                    ("loss_too_big" if not loss_within_limit else
-                                     ("z_not_converged" if not z_clearly_converged else
-                                      ("false_convergence" if not spread_reversion_ok else "unknown")))
-                                ),
-                            }, print_terminal=False)
+                        # Nueva regla: si z revirtió y estamos en pérdida bruta,
+                        # NO cerrar por TP. Mantener la posición y dejar que
+                        # gobiernen HARD_SL (pérdida monetaria absoluta) o Z_SL
+                        # (z se aleja más en contra). Si el spread vuelve a moverse
+                        # a favor, podremos cerrar como TP real cuando ok_profit pase.
+                        tp_blocked_profit_count += 1
+                        log_event({
+                            "type": "tp_blocked_loss",
+                            "trace_id": trace_id,
+                            "m1": m1, "m2": m2,
+                            "pnl_gross": pnl_gross,
+                            "net_est": net_pnl_est,
+                            "open_fees": open_fees_paid,
+                            "close_fees_est": close_fees_est,
+                            "z_now": z_now,
+                            "z_entry": z_entry,
+                            "age_hours": age_hours,
+                            "policy": "hold_until_hard_sl_or_zsl",
+                        }, print_terminal=False)
                     else:
                         # pnl_gross > 0 but not enough to cover fees + min net profit yet.
                         # Keep waiting — the spread might improve further.

@@ -171,49 +171,13 @@ async def _get_subaccount(indexer):
 
 
 async def _get_live_markets_with_position(indexer):
-    """
-    Return a set of markets that currently have a non-zero open position.
-
-    2026-07-01 fix: incluye TANTO las posiciones del indexer (chain state) COMO
-    las de bot_agents.json (local state). Razón: hay ~1-5s de lag entre que
-    el bot abre un par (chain update) y el indexer lo refleja. Si el scan
-    siguiente corre en esa ventana, live_markets NO incluye el par recién
-    abierto → bot intenta abrir OTRO par con leg compartida → PRE_COMMIT_
-    EXPOSURE_DETECTED lo caza pero gasta 2 tx_limit inútiles.
-
-    Caso real (2026-07-01): OP/SEI abrió, siguiente scan intentó ETC/OP, error.
-
-    La unión (chain ∪ json) evita este race sin sacrificar correctitud —
-    si el JSON tiene un par que ya cerró pero el indexer aún no lo refleja,
-    el resultado es "no abrir un trade que compartiría leg", que es lo
-    correcto (conservador).
-    """
+    """Return a set of markets that currently have a non-zero open position."""
+    sub = await _get_subaccount(indexer)
+    positions = sub.get("openPerpetualPositions", {}) or sub.get("perpetualPositions", {}) or {}
     live = set()
-
-    # 1. Del indexer (chain state real)
-    try:
-        sub = await _get_subaccount(indexer)
-        positions = sub.get("openPerpetualPositions", {}) or sub.get("perpetualPositions", {}) or {}
-        for m, p in positions.items():
-            if abs(_sf(p.get("size"))) > 0:
-                live.add(m)
-    except Exception:
-        pass
-
-    # 2. De bot_agents.json (local state — catches recent opens antes de indexer lag)
-    try:
-        with open(JSON_PATH, "r") as f:
-            bot_agents = json.load(f) or []
-        for pair in bot_agents:
-            if not isinstance(pair, dict):
-                continue
-            m1 = pair.get("market_1")
-            m2 = pair.get("market_2")
-            if m1: live.add(m1)
-            if m2: live.add(m2)
-    except Exception:
-        pass
-
+    for m, p in positions.items():
+        if abs(_sf(p.get("size"))) > 0:
+            live.add(m)
     return live
 
 
@@ -581,17 +545,7 @@ async def open_positions(
             _max_z_seen = abs(z_score)
             _best_low_z_pair = f"{base_market}/{quote_market}"
 
-        # 2026-07-01: DYNAMIC per-pair entry threshold.
-        # Cada par tiene su propio z_entry_threshold basado en p95 de su
-        # distribución histórica de |z|. Fallback al global ZSCORE_THRESH
-        # si el CSV es viejo y no tiene la columna.
-        _z_entry_dyn = row.get("z_entry_threshold") if "z_entry_threshold" in row.index else None
-        try:
-            _z_entry_dyn = float(_z_entry_dyn) if _z_entry_dyn is not None and not pd.isna(_z_entry_dyn) else float(ZSCORE_THRESH)
-        except Exception:
-            _z_entry_dyn = float(ZSCORE_THRESH)
-
-        if abs(z_score) < _z_entry_dyn:
+        if abs(z_score) < ZSCORE_THRESH:
             _skip_low_z += 1
             continue
 
@@ -634,44 +588,9 @@ async def open_positions(
 
         spread_dev = abs(spread_last - spread_mean_prev)
 
-        # 2026-07-06 fix (Bug matemático final): HEDGE-WEIGHTED sizing.
-        # ANTES: base_quantity = eff_usd/base_price, quote_quantity = eff_usd/quote_price
-        #        → equal-dollar sizing pero spread usa hedge_ratio → POSICIÓN NO
-        #        MARKET-NEUTRAL. Cuando z converge pero prices se mueven juntos,
-        #        la posición pierde por exposición direccional residual.
-        #
-        # AHORA: size_2 = size_1 × hedge_ratio (unidades), luego ambas se
-        # ESCALAN para que el notional TOTAL sea ~2 × eff_usd (budget).
-        # Con esto, dValue = 0 cuando dP1 = hedge_ratio × dP2 (verdaderamente
-        # market-neutral).
-        #
-        # Impacto esperado: winrate sube de ~15% a ~40-50% porque cada trade
-        # solo depende de convergencia del spread, no de movimientos direccionales.
-
-        # Raw quantities respecting hedge ratio
-        raw_base_q = 1.0
-        raw_quote_q = 1.0 * hedge_ratio
-        raw_base_notional = raw_base_q * base_price
-        raw_quote_notional = raw_quote_q * quote_price
-        raw_total_notional = raw_base_notional + raw_quote_notional
-        target_total_notional = eff_usd * 2.0  # both legs combined budget
-
-        if raw_total_notional > 0:
-            scale = target_total_notional / raw_total_notional
-        else:
-            scale = 0.0
-
-        base_quantity = raw_base_q * scale
-        quote_quantity = raw_quote_q * scale
-
-        # Sanity check: notional per leg must be positive
-        _actual_base_notional = base_quantity * base_price
-        _actual_quote_notional = quote_quantity * quote_price
-
-        # 2026-07-04 fix (Bug #3): usar base_quantity para el edge.
-        # spread está en unidades de precio de leg 1 (porque hedge_ratio × price_2
-        # traduce a esas unidades). El edge por convergencia es spread_dev × qty_leg1.
-        approx_spread_usd = spread_dev * base_quantity
+        base_quantity = eff_usd / base_price
+        quote_quantity = eff_usd / quote_price
+        approx_spread_usd = spread_dev * min(base_quantity, quote_quantity)
 
         base_side = "BUY" if z_score < 0 else "SELL"
         quote_side = "BUY" if z_score > 0 else "SELL"
@@ -700,14 +619,6 @@ async def open_positions(
         hl_f = max(1.0, float(half_life or 20.0))
         score = abs(z_score) * (1.0 / hl_f) * (100.0 / max(1.0, spread_bps))
 
-        # 2026-07-01: pass dynamic z_exit_threshold to candidate dict
-        # so BotAgent + exit_manager can use per-pair exit level.
-        _z_exit_dyn = row.get("z_exit_threshold") if "z_exit_threshold" in row.index else None
-        try:
-            _z_exit_dyn = float(_z_exit_dyn) if _z_exit_dyn is not None and not pd.isna(_z_exit_dyn) else 0.7
-        except Exception:
-            _z_exit_dyn = 0.7
-
         candidates.append({
             "base_market": base_market,
             "quote_market": quote_market,
@@ -727,12 +638,6 @@ async def open_positions(
             "score": score,
             "spread_std": spread_std,
             "spread_mean": spread_mean,
-            "z_entry_threshold_dyn": _z_entry_dyn,   # for logging / audit
-            "z_exit_threshold_dyn": _z_exit_dyn,     # used by exit manager
-            # 2026-07-03: Absolute spread tracking to detect false z-convergence
-            # (when rolling mean catches up to spread without spread actually moving)
-            "spread_at_entry": spread_last,          # spread value at open
-            "mean_at_entry": spread_mean_prev,       # rolling mean value at open
         })
 
         # Actualizar contadores de concentración por mercado
@@ -924,17 +829,6 @@ async def open_positions(
             min_m1_fill_usd=dynamic_min_fill,      # 2026-05-26: scales with eff_usd
         )
 
-        # 2026-07-01: pasar z_exit_threshold dinámico al order_dict que se
-        # persistirá en bot_agents.json. El exit manager lo leerá desde ahí.
-        bot_agent.order_dict["z_exit_threshold_dyn"] = float(cand.get("z_exit_threshold_dyn", 0.7))
-        bot_agent.order_dict["z_entry_threshold_dyn"] = float(cand.get("z_entry_threshold_dyn", 2.7))
-        # 2026-07-03: absolute spread tracking for false-convergence detection
-        try:
-            bot_agent.order_dict["spread_at_entry"] = float(cand.get("spread_at_entry", 0.0))
-            bot_agent.order_dict["mean_at_entry"] = float(cand.get("mean_at_entry", 0.0))
-        except Exception:
-            pass
-
         bot_open_dict = await bot_agent.open_trades(wallet)
 
         # Always log result
@@ -1013,18 +907,6 @@ async def open_positions(
                 "quote": quote_market,
                 "reason": skip_reason,
             })
-            # 2026-07-01 fix: SPREAD_CEILING y SPREAD_COST_EXCEEDS_EDGE_PCT son
-            # gates que probablemente seguirán bloqueando por horas (spreads y
-            # edges en pares específicos no cambian rápido). Sin cooldown, el bot
-            # re-intenta el mismo par indefinidamente.
-            # v2 (2026-07-01): añadido SPREAD_COST también para cooldown.
-            if "SPREAD_CEILING" in skip_reason or "SPREAD_COST_EXCEEDS_EDGE" in skip_reason:
-                fail_count = _record_pair_fail(base_market, quote_market)
-                if fail_count >= PAIR_FAIL_COOLDOWN_THRESHOLD:
-                    log_event({"type": "pair_fail_cooldown_set", "base": base_market,
-                               "quote": quote_market, "consecutive_fails": fail_count,
-                               "cooldown_hours": PAIR_FAIL_COOLDOWN_HOURS,
-                               "trigger": "spread_gate_repeated"})
             continue
 
         # Not LIVE: check for orphan exposure, gated on committed flag.
@@ -1041,18 +923,6 @@ async def open_positions(
             bot_open_dict["pair_status"] = "ORPHAN"
             bot_open_dict["needs_reconcile"] = True
             bot_open_dict["opened_at"] = bot_open_dict.get("opened_at") or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-            # 2026-07-06 debug fix (Bug A): guardar TAMBIÉN los campos de PnL
-            # aquí. Antes solo se guardaban en el path LIVE, así que si un par
-            # se marcaba ORPHAN (por race condition indexer) y después se
-            # recuperaba a LIVE (manual o auto), _has_pnl_fields() retornaba
-            # False → can_pnl=False → todos los TP gates bloqueados → zombie.
-            # Caso real: UNI/SUI 69h abierto con tp_confirm=584 sin cerrar.
-            bot_open_dict["side_1"] = bot_open_dict.get("side_1") or base_side
-            bot_open_dict["side_2"] = bot_open_dict.get("side_2") or quote_side
-            bot_open_dict["price_1"] = bot_open_dict.get("price_1") or cand["base_price"]
-            bot_open_dict["price_2"] = bot_open_dict.get("price_2") or cand["quote_price"]
-            bot_open_dict["size_1"] = bot_open_dict.get("size_1") or _sf(bot_open_dict.get("filled_size_1"), _sf(cand["base_size_fmt"]))
-            bot_open_dict["size_2"] = bot_open_dict.get("size_2") or _sf(bot_open_dict.get("filled_size_2"), _sf(cand["quote_size_fmt"]))
             bot_agents.append(bot_open_dict)
             with open(JSON_PATH, "w") as f:
                 json.dump(bot_agents, f, indent=2)

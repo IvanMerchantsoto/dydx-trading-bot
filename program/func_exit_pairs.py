@@ -644,7 +644,10 @@ async def manage_trade_exits(node, indexer, wallet):
                     # 2026-07-06: escalado con equity $641 y sizing $65/leg.
                     # Antes $60 notional → -$0.75 (~1.25% loss).
                     # Ahora $130 notional → -$1.60 (~1.25% loss, mismo % relativo).
-                    MEAN_REVERTED_MAX_LOSS_ZC = -1.60
+                    # 2026-07-07 fix (Bug #2): AJUSTADO A -$0.30 igual que
+                    # MEAN_REVERTED_MAX_LOSS. Ver comentario detallado en la
+                    # otra sección de exit_pairs.py.
+                    MEAN_REVERTED_MAX_LOSS_ZC = -0.30
                     MIN_AGE_FOR_ZC_LOSS_EXIT_MIN = 30.0
                     age_ok = (age_min is not None and age_min >= MIN_AGE_FOR_ZC_LOSS_EXIT_MIN)
                     loss_ok = (pnl_gross >= MEAN_REVERTED_MAX_LOSS_ZC)
@@ -794,7 +797,18 @@ async def manage_trade_exits(node, indexer, wallet):
                         # Además evita el fee bleed prolongado observado en UNI/SUI.
                         # 2026-07-06: escalado con equity $641 y sizing $65/leg.
                         # ~1.25% del notional (mismo % relativo que antes con $60).
-                        MEAN_REVERTED_MAX_LOSS = -1.60  # aceptable pérdida chica
+                        #
+                        # 2026-07-07 fix (Bug #2): AJUSTADO A -$0.30 (breakeven).
+                        # ANÁLISIS del último día (12h, 10 trades cerrados):
+                        #   - Winrate solo 30%, avg PnL -$0.033/trade
+                        #   - Este gate estaba realizando pérdidas chicas
+                        #     sistemáticamente (-$0.30 a -$1.60) en cada
+                        #     "convergencia" del spread.
+                        #   - Junio 30 (rentable): esta rama era HOLD, no CLOSE
+                        # Nueva regla: solo cerrar en profit real (net > 0)
+                        # o breakeven duro (-$0.30). Si spread revierte pero
+                        # sigue en pérdida, HOLD hasta HARD_SL o rebote.
+                        MEAN_REVERTED_MAX_LOSS = -0.30  # solo permite quasi-breakeven
                         MIN_AGE_FOR_LOSS_EXIT_MIN = 30.0
                         MIN_SPREAD_REVERSION = 0.5  # spread absoluto debe haber convergido >=50%
                         age_ok = (age_min is not None and age_min >= MIN_AGE_FOR_LOSS_EXIT_MIN)

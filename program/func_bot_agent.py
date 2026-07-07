@@ -822,22 +822,65 @@ class BotAgent:
                 self.order_dict["comments"] = f"Min-fill gate hit; flatten failed: {e}"
             return self.order_dict
 
-        # Residual USD
-        residual_usd = filled_usd_1 - filled_usd_2
+        # ═════════════════════════════════════════════════════════════════
+        # 2026-07-07 fix (Bug #1 CRÍTICO):
+        # ANTES: residual_usd = filled_usd_1 - filled_usd_2, con tol $2.
+        #   Este check asume EQUAL-DOLLAR sizing (legs deberían tener igual
+        #   notional). PERO con hedge-weighted sizing (Jul 6), los notionals
+        #   son INTENCIONALMENTE distintos cuando hedge_ratio ≠ price_ratio.
+        #   Ejemplo: LINK/MANA con hedge_ratio=108, price_ratio=26 → N1=$25,
+        #   N2=$105 (diff $80!). El flatten cerraba $80 de MANA, destruyendo
+        #   la neutralidad market-neutral. Posición se volvía direccional.
+        #
+        # AHORA: residual se mide como diferencia entre el SIZE RATIO real
+        # (Q2/Q1) y el hedge_ratio target. Solo flatten si el ratio está
+        # muy fuera (>15% desviación). Esto preserva la neutralidad.
+        # ═════════════════════════════════════════════════════════════════
+        residual_usd = filled_usd_1 - filled_usd_2  # sigue en record para logging
         effective_usd = max(1e-9, min(filled_usd_1, filled_usd_2))
-        tol = max(2.0, 0.02 * effective_usd)
+
+        # Calcular size ratio real vs hedge_ratio esperado
+        _hedge_ratio_target = float(getattr(self, "hedge_ratio", 1.0) or 1.0)
+        _size_ratio_actual = (
+            real_filled_m2 / real_filled_m1
+            if real_filled_m1 > 0 else 0.0
+        )
+        # Desviación en % del hedge_ratio target
+        _ratio_deviation_pct = (
+            abs(_size_ratio_actual - _hedge_ratio_target) / max(abs(_hedge_ratio_target), 1e-10) * 100.0
+            if _hedge_ratio_target != 0 else 0.0
+        )
+
+        # Tolerancia: 15% de desviación en el ratio, o mínimo absoluto $10
+        # (para catch fills muy raros donde una leg quedó al 50%).
+        MAX_RATIO_DEVIATION_PCT = 15.0
+        MAX_ABSOLUTE_RESIDUAL_USD = max(10.0, 0.15 * effective_usd)
+        tol = MAX_ABSOLUTE_RESIDUAL_USD  # legacy field name
 
         self.order_dict["residual_usd"] = float(residual_usd)
         self.order_dict["residual_tol"] = float(tol)
+        self.order_dict["size_ratio_actual"] = float(_size_ratio_actual)
+        self.order_dict["size_ratio_target"] = float(_hedge_ratio_target)
+        self.order_dict["ratio_deviation_pct"] = float(_ratio_deviation_pct)
 
         log_event({
             "type": "residual",
             "trace_id": self.trace_id,
             "residual_usd": residual_usd,
-            "tol_usd": tol,
+            "hedge_ratio_target": _hedge_ratio_target,
+            "size_ratio_actual": _size_ratio_actual,
+            "ratio_deviation_pct": _ratio_deviation_pct,
+            "max_dev_pct": MAX_RATIO_DEVIATION_PCT,
+            "max_abs_residual_usd": MAX_ABSOLUTE_RESIDUAL_USD,
         })
 
-        if abs(residual_usd) > tol:
+        # Trigger flatten solo si AMBOS: ratio desviado >15% Y residual absoluto >$10
+        # (evita flatten cuando ratio no perfecto pero notional aún balanceado por scale)
+        _needs_flatten = (
+            _ratio_deviation_pct > MAX_RATIO_DEVIATION_PCT and
+            abs(residual_usd) > MAX_ABSOLUTE_RESIDUAL_USD
+        )
+        if _needs_flatten:
             self.order_dict["flattened"] = True
             try:
                 if residual_usd > 0:

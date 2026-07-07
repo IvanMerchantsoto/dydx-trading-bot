@@ -273,7 +273,7 @@ def store_cointegration_results(df_market_prices):
                     #
                     # Sanity limits:
                     #   entry: clamped to [1.8, 4.0]
-                    #   exit:  clamped to [0.3, 1.5]
+                    #   exit:  clamped to [0.7, 1.5]  (2026-07-07 fix Bug #3: 0.3→0.7)
                     try:
                         spread_series = pd.Series(spread_arr)
                         z_hist_mean = spread_series.rolling(window=WINDOW).mean()
@@ -284,8 +284,14 @@ def store_cointegration_results(df_market_prices):
                             z_entry_dyn = float(np.percentile(z_abs, 90))
                             z_exit_dyn = float(np.percentile(z_abs, 30))
                             # Clamp to safe range
+                            # 2026-07-07 fix (Bug #3): floor de z_exit subido
+                            # de 0.3 → 0.7. Con 0.3, muchos pares NUNCA cerraban
+                            # por TP porque exigía convergencia extrema (z<0.3).
+                            # 0.7 es el valor que usaba junio 30 (rentable).
+                            # Facilita cierre en profit cuando spread revierte
+                            # razonablemente (no necesita ir hasta z=0).
                             z_entry_dyn = max(1.8, min(4.0, z_entry_dyn))
-                            z_exit_dyn = max(0.3, min(1.5, z_exit_dyn))
+                            z_exit_dyn = max(0.7, min(1.5, z_exit_dyn))
                         else:
                             z_entry_dyn = 2.2   # fallback (más lenient también)
                             z_exit_dyn = 0.7

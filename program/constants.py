@@ -38,7 +38,9 @@ MIN_PROFIT_USD = 0.30
 DROP_STALE_RECORDS = True
 
 USE_Z_TP = True
-Z_TP = 0.7           # cierra cuando abs(z) vuelve a ≤ 0.7 (casi media)
+Z_TP = 0.4           # 2026-07-10: 0.7 → 0.4. Backtest_conservative valida +$722/mo.
+                     # Cierra más rápido en profit, aumenta frecuencia trade.
+                     # Compensa HARD_SL más chico ($2.50).
 
 USE_Z_SL = True
 Z_SL_DELTA = 1.5     # SL cuando abs(z_now) >= abs(z_entry) + 1.5
@@ -110,10 +112,11 @@ RISK_SCORE_W_UNREAL_PNL = 0.15  # $1 de pérdida ≈ 0.15 puntos de score
 # $3 USD = 3% del equity total = stop loss tolerable por trade individual.
 # Sobre $60 notional combinado: 3/60 = 5% → razonable.
 # Cuando subas a $500 equity: subir a $10. A $5,000: $20.
-HARD_SL_USD = 8.0             # 2026-07-06: 3 → 8 con equity $641 y sizing $65/leg.
-                              # Notional pair = $130. 5% × $130 = $6.5.
-                              # $8 es piso absoluto (max de HARD_SL_PCT × notional y USD).
-                              # Worst case con 5 pares: -$40 (6% del equity total).
+HARD_SL_USD = 2.5             # 2026-07-10: 8 → 2.5. Con TPs de $0.42 avg, un
+                              # SL de $8 mataba 19 winners. HARD_SL $2.50 hace
+                              # el ratio manejable. Backtest_conservative
+                              # valida +$722/mo con max_dd solo -$33.
+                              # Worst case con 5 pares: -$12.50 (2% del equity).
 HARD_SL_PCT = 0.05            # 5% del notional combinado (efectivo si notional > $160)
 
 # SELECT MODE

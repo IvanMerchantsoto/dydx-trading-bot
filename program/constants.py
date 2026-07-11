@@ -118,7 +118,10 @@ HARD_SL_USD = 2.5             # 2026-07-10: 8 → 2.5. Con TPs de $0.42 avg, un
                               # el ratio manejable. Backtest_conservative
                               # valida +$722/mo con max_dd solo -$33.
                               # Worst case con 5 pares: -$12.50 (2% del equity).
-HARD_SL_PCT = 0.05            # 5% del notional combinado (efectivo si notional > $160)
+HARD_SL_PCT = 0.02            # 2026-07-10: 0.05 → 0.02. Con 5% y notional $130,
+                              # el max() daba SL efectivo $6.50 (anulando $2.50 USD).
+                              # Con 0.02 × $130 = $2.60, se alinea con HARD_SL_USD.
+                              # Si escalás sizing, HARD_SL crece proporcional.
 
 # SELECT MODE
 # 2026-05-26: cambiado a PRODUCTION para operar $100 USD en mainnet.

@@ -2,10 +2,11 @@ from decouple import config
 
 # ===== Loop / Cadencia =====
 EXIT_CHECK_SECONDS = 30       # cada cuánto evalúas exits (segundos)
-KPI_SECONDS = 600             # cada cuánto mandas KPIs (10 min)
-SESSION_SUMMARY_SECONDS = 300 # cada cuánto mandas resumen de rentabilidad de sesión (5 min)
+KPI_SECONDS = 3600            # 2026-07-10: 10min → 1h (menos spam Telegram)
+SESSION_SUMMARY_SECONDS = 1800  # 2026-07-10: 5min → 30min
+POSITIONS_STATUS_SECONDS = 900 # 2026-07-10 NUEVO: status por par cada 15min
 BATCH_OPEN_TRADES = 3         # abrir N trades y luego forzar revisión
-MAX_OPEN_TRADES = 5           # 2026-07-06: subido de 3 a 5 con equity $641.
+MAX_OPEN_TRADES = 10          # 2026-07-10: 5 → 10. Cap absoluto de seguridad.
                               # Estrategia diversificación: 5 pares × $65/leg =
                               # $650 notional (~igual al de 3×$100), pero:
                               #   - Variance portfolio: 33% → 20%
@@ -329,7 +330,10 @@ ZSCORE_THRESH = 2.7    # 2026-05-22: bajado de 3.0 a 2.7 tras backtest OOS compa
                        # ZSCORE_THRESH anterior fijo en 3.0 capturaba solo 8% de escaneos vs ~20% con 2.7
                        # (en log del bot 2026-05-19/22). 2.5× más oportunidades, mismo nivel de calidad.
 USD_PER_TRADE = 65           # 2026-07-06: fallback si dynamic falla. $65/leg (config $641 equity).
-USD_MIN_COLLATERAL = 70      # 2026-07-06: subido a $70 (~1.1× sizing). Bot pausa si free < $70.
+USD_MIN_COLLATERAL = 150     # 2026-07-10: 70 → 150. Bot pausa nuevas entries
+                              # si free < $150. Con equity $612 esto deja abrir
+                              # hasta ~7-8 pares antes de tocar el gate.
+                              # El gate real es free < max(150, eff_usd*1.5).
                               # Con $100 equity, deja $70 de buffer para variaciones.
                               # Cuando subas equity a $500+: subir a $150.
 

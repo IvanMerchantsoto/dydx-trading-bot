@@ -8,7 +8,7 @@ from func_public import construct_market_prices
 from func_entry_pairs import open_positions
 from func_cointegration import store_cointegration_results, CSV_PATH as COINT_CSV_PATH
 from func_exit_pairs import manage_trade_exits
-from func_kpis import send_account_kpis
+from func_kpis import send_account_kpis, send_positions_status
 from func_risk_off import risk_off_close_worst_pair
 from func_messaging import send_message
 from func_logging import log_event
@@ -22,6 +22,7 @@ from constants import (
     EXIT_CHECK_SECONDS,
     KPI_SECONDS,
     SESSION_SUMMARY_SECONDS,
+    POSITIONS_STATUS_SECONDS,
     BATCH_OPEN_TRADES,
     MAX_OPEN_TRADES,
     USD_PER_TRADE,
@@ -145,6 +146,7 @@ async def main():
     last_kpi_ts = loop.time()
     last_coint_refresh_ts = loop.time()
     last_summary_ts = loop.time()
+    last_positions_status_ts = loop.time()
     session_start_wall = time.time()   # wall-clock start for session age display
 
     # ── Drawdown circuit breaker state ────────────────────────────────────
@@ -283,6 +285,17 @@ async def main():
             except Exception as e:
                 print(f"[D4] KPI error: {e}", flush=True)
                 last_kpi_ts = now
+
+        # ── Positions status por par (2026-07-10 NUEVO) ─────────────────────
+        # Cada POSITIONS_STATUS_SECONDS envía a Telegram detalle POR PAR:
+        # entry_z, best_z, unreal_pnl, age. Ayuda al usuario a decidir manual.
+        print(f"[D4c] positions status check (elapsed={(now-last_positions_status_ts):.0f}s / {POSITIONS_STATUS_SECONDS}s)", flush=True)
+        if now - last_positions_status_ts >= POSITIONS_STATUS_SECONDS:
+            last_positions_status_ts = now
+            try:
+                await send_positions_status(indexer)
+            except Exception as e:
+                print(f"[D4c] positions status error: {e}", flush=True)
 
         # ── Session profitability summary ─────────────────────────────────
         print(f"[D4b] summary check (elapsed={(now-last_summary_ts):.0f}s / {SESSION_SUMMARY_SECONDS}s)", flush=True)

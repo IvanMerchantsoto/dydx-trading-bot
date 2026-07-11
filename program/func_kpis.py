@@ -222,3 +222,102 @@ async def send_account_kpis(indexer, send_telegram: bool = True) -> Optional[Dic
         if send_telegram:
             send_message(f"⚠️ KPI error: {e}")
         return None
+
+
+async def send_positions_status(indexer) -> None:
+    """
+    2026-07-10 NUEVO: envía un mensaje Telegram con detalle POR PAR:
+      - Markets del par
+      - entry_z (z al abrir)
+      - best_z (mejor z visto desde apertura — más cerca de 0 mejor)
+      - z_now (aprox del PnL: si tenemos oracles, calc PnL)
+      - unreal_pnl actual
+      - edad
+
+    Ayuda a decidir manualmente si esperar o cerrar cada par.
+
+    Fuente:
+      - bot_agents.json (entry_z, best_z, opened_at)
+      - dYdX indexer (unrealizedPnl actual, positions)
+    """
+    from datetime import datetime, timezone
+
+    try:
+        with open(JSON_PATH, "r") as f:
+            pairs = json.load(f) or []
+        pairs = [p for p in pairs if isinstance(p, dict)]
+
+        if not pairs:
+            # No mandar mensaje si no hay pares abiertos (evita spam)
+            return
+
+        # Fetch positions del indexer
+        try:
+            resp = await indexer.account.get_subaccount(WALLET_ADDRESS.strip(), 0)
+            sub = resp.get("subaccount", {}) or {}
+            live_positions = sub.get("openPerpetualPositions", {}) or {}
+            equity = _to_float(sub.get("equity"), 0.0)
+            free = _to_float(sub.get("freeCollateral"), 0.0)
+        except Exception:
+            live_positions = {}
+            equity = free = 0.0
+
+        now = datetime.now(timezone.utc)
+        lines = ["📍 *Estado de pares abiertos*", ""]
+
+        total_unreal = 0.0
+        for i, p in enumerate(pairs, 1):
+            m1 = p.get("market_1", "?")
+            m2 = p.get("market_2", "?")
+            entry_z = _to_float(p.get("z_score"), 0.0)
+            best_z = _to_float(p.get("best_z"), abs(entry_z))
+            status = p.get("pair_status", "?")
+
+            # Age
+            opened_at_str = p.get("opened_at", "")
+            age_str = "?"
+            try:
+                if opened_at_str:
+                    opened = datetime.fromisoformat(opened_at_str.replace("Z", "+00:00"))
+                    age_h = (now - opened).total_seconds() / 3600.0
+                    if age_h < 1:
+                        age_str = f"{age_h*60:.0f}min"
+                    else:
+                        age_str = f"{age_h:.1f}h"
+            except Exception:
+                pass
+
+            # Unreal PnL de cada leg (sum)
+            u1 = _to_float(live_positions.get(m1, {}).get("unrealizedPnl"), 0.0)
+            u2 = _to_float(live_positions.get(m2, {}).get("unrealizedPnl"), 0.0)
+            unreal = u1 + u2
+            total_unreal += unreal
+
+            emoji = "🟢" if unreal > 0 else ("🔴" if unreal < -0.5 else "🟡")
+            lines.append(
+                f"{emoji} *{m1}/{m2}* ({age_str}) [{status}]"
+            )
+            lines.append(
+                f"   z_entry={entry_z:+.2f}  best_z={best_z:.2f}  "
+                f"unreal=${unreal:+.2f}"
+            )
+            lines.append("")
+
+        lines.append(f"💰 Equity: ${equity:.2f}  Free: ${free:.2f}")
+        lines.append(f"📊 Total unreal: ${total_unreal:+.2f}")
+
+        msg = "\n".join(lines)
+        send_message(msg)
+
+        log_event({
+            "type": "positions_status_sent",
+            "n_pairs": len(pairs),
+            "total_unreal": round(total_unreal, 3),
+            "equity": equity,
+        }, print_terminal=False)
+
+    except Exception as e:
+        log_event({
+            "type": "positions_status_error",
+            "error": str(e),
+        })

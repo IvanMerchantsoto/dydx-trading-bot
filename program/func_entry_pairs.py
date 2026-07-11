@@ -907,6 +907,23 @@ async def open_positions(
                 "quote": quote_market,
                 "reason": skip_reason,
             })
+            # 2026-07-11 fix: SPREAD_CEILING/SPREAD_COST_EXCEEDS_EDGE seguirán
+            # bloqueando por horas (spreads en pares específicos no cambian
+            # rápido). Sin cooldown, el bot re-intenta el mismo par cada scan
+            # y no llega a otros candidatos válidos.
+            # Caso real observado: HBAR-USD 399bps > 250bps repetido cada
+            # scan durante 60min sin cooldown.
+            if "SPREAD_CEILING" in skip_reason or "SPREAD_COST_EXCEEDS_EDGE" in skip_reason:
+                fail_count = _record_pair_fail(base_market, quote_market)
+                if fail_count >= PAIR_FAIL_COOLDOWN_THRESHOLD:
+                    log_event({
+                        "type": "pair_fail_cooldown_set",
+                        "base": base_market,
+                        "quote": quote_market,
+                        "consecutive_fails": fail_count,
+                        "cooldown_hours": PAIR_FAIL_COOLDOWN_HOURS,
+                        "trigger": "spread_gate_repeated",
+                    })
             continue
 
         # Not LIVE: check for orphan exposure, gated on committed flag.

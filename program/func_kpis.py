@@ -293,13 +293,19 @@ async def send_positions_status(indexer) -> None:
             unreal = u1 + u2
             total_unreal += unreal
 
+            # 2026-07-11: incluir z_now (guardado por exit manager cada scan)
+            z_now_saved = p.get("z_now", None)
+            z_now_str = f"z_now={float(z_now_saved):+.2f}  " if z_now_saved is not None else ""
+
             emoji = "🟢" if unreal > 0 else ("🔴" if unreal < -0.5 else "🟡")
             lines.append(
                 f"{emoji} *{m1}/{m2}* ({age_str}) [{status}]"
             )
             lines.append(
-                f"   z_entry={entry_z:+.2f}  best_z={best_z:.2f}  "
-                f"unreal=${unreal:+.2f}"
+                f"   z_entry={entry_z:+.2f}  {z_now_str}best_z={best_z:.2f}"
+            )
+            lines.append(
+                f"   unreal=${unreal:+.2f}"
             )
             lines.append("")
 

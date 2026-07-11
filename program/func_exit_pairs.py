@@ -466,6 +466,8 @@ async def manage_trade_exits(node, indexer, wallet):
             current_best_z = _sf(position.get("best_z", abs(z_now) + 99.0))
             if abs(z_now) < current_best_z:
                 position["best_z"] = abs(z_now)
+            # 2026-07-11: guardar z_now también para mostrar en Telegram
+            position["z_now"] = float(z_now)
             # (if z_now is None this loop, keep whatever best_z we had)
 
         # PnL calculation (proxy using oracle prices)

@@ -26,17 +26,34 @@ Uso (en la VM):
 import argparse
 import json
 import os
+import re
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
 
-from constants import INDEXER, WALLET_ADDRESS
-
 SCRIPT_DIR = Path(__file__).parent
-BASE = INDEXER.rstrip("/")
 _S = requests.Session()
+
+
+def _read_const(name, default=None):
+    """
+    Lee una constante de tipo string de constants.py SIN importarlo (evita la
+    dependencia de decouple/.env, para poder correr con cualquier python).
+    Ignora la línea comentada de testnet (empieza con '#').
+    """
+    try:
+        txt = (SCRIPT_DIR / "constants.py").read_text()
+        m = re.search(rf'^{name}\s*=\s*"([^"]+)"', txt, re.M)
+        return m.group(1) if m else default
+    except Exception:
+        return default
+
+
+DEFAULT_ADDRESS = _read_const("WALLET_ADDRESS", "")
+DEFAULT_INDEXER = _read_const("INDEXER_MAINNET", "https://indexer.dydx.trade")
+BASE = DEFAULT_INDEXER.rstrip("/")  # se sobreescribe en main() con --indexer
 
 
 def _sf(x, d=0.0):
@@ -187,13 +204,20 @@ def read_internal_pnl(log_paths, days):
 
 
 def main():
+    global BASE
     ap = argparse.ArgumentParser(description="Reconciliación PnL real (fills+funding) vs interno")
     ap.add_argument("--days", type=int, default=7)
     ap.add_argument("--log", action="append", default=None)
+    ap.add_argument("--address", default=DEFAULT_ADDRESS, help="Dirección dYdX (default: la de constants.py)")
+    ap.add_argument("--indexer", default=DEFAULT_INDEXER, help="URL del indexer")
     args = ap.parse_args()
+    BASE = args.indexer.rstrip("/")
     log_paths = args.log or [str(SCRIPT_DIR / "bot_run.log.jsonl"),
                              str(SCRIPT_DIR / "logs" / "bot_run.log.jsonl")]
-    addr = WALLET_ADDRESS.strip()
+    addr = (args.address or "").strip()
+    if not addr:
+        print("ERROR: no pude leer WALLET_ADDRESS de constants.py; pásala con --address dydx1...")
+        return
 
     print(f"\n{'='*70}\n  RECONCILIACIÓN DE PnL — últimos {args.days} días\n  Wallet: {addr}\n{'='*70}")
     print("\nDescargando fills, funding, posiciones y PnL del exchange...")

@@ -636,31 +636,17 @@ async def manage_trade_exits(node, indexer, wallet):
                 position["tp_in_zone"] = tp_zone
             else:
                 # ═══════════════════════════════════════════════════════════
-                # 2026-07-11 STICKY TP MODE
-                # Diagnóstico: con TRAIL=False, el modo antiguo era
-                # `tp_zone = abs(z_now) <= Z_TP`. En real (scans 30s), el z
-                # rebotaba entre scans. 4 pares tocaron best_z <= 0.03 y NO
-                # cerraron porque cuando había 2 confirms consecutivos con
-                # ok_profit no se alineaban.
-                #
-                # Fix: una vez que |z_now| toca <= Z_TP, marcamos
-                # tp_zone_reached = True (persiste en el dict de la posición).
-                # En scans siguientes, tp_zone sigue True para permitir
-                # capturar el cierre cuando pnl_gross > min_profit.
-                #
-                # Backtest_tp_modes: STICKY -$20 vs FIXED en 1h data, pero
-                # esperamos mucho mejor en real 30s (evita missing moments).
+                # 2026-07-12 TP ESTRICTO (revertido el STICKY MODE)
+                # El piloto mostró que el sticky latch (tp_zone_reached) mantuvo
+                # un trade ~5h y lo cerró en z=-1.46 etiquetado como "TP<=0.7
+                # confirms=223": una vez que |z| tocaba la zona, el flag quedaba
+                # pegado y el gate de profit obligaba a esperar a que el spread
+                # SOBREPASARA la media para juntar profit → frágil (pudo revertir
+                # a HARD_SL). Ahora: tp_zone = |z_now| <= Z_TP EN ESTE scan. El
+                # caso de "cruzó la media entre muestras" ya lo captura
+                # TP_CROSSED_ZERO (bloque 2b) de forma inmediata con net>0.
                 # ═══════════════════════════════════════════════════════════
-                # Retroactive: si best_z (guardado) <= Z_TP, ya alcanzó zone
-                # históricamente (aunque el flag tp_zone_reached no existiera).
-                # Esto rescata los 4 pares actuales con best_z=[0.005, 0.017,
-                # 0.019, 0.29] que no cerraron por el bug.
-                _best_z_saved = _sf(position.get("best_z", 99.0))
-                if abs(z_now) <= float(Z_TP) or _best_z_saved <= float(Z_TP):
-                    position["tp_zone_reached"] = True
-                    tp_zone = True
-                else:
-                    tp_zone = bool(position.get("tp_zone_reached", False))
+                tp_zone = abs(z_now) <= float(Z_TP)
 
         tp_confirm = int(position.get("tp_confirm", 0) or 0)
 

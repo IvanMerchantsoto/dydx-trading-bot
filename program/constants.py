@@ -148,8 +148,15 @@ MAKER_FEE_BPS = 0.0002    # 0.02% per leg (maker) — used for savings estimate 
 # Disabled in DEVELOPMENT: testnet orderbooks are too thin for POST_ONLY to fill
 # within the timeout window (0/N fills observed — all fall back to taker anyway,
 # wasting 45s and adding complexity). Enable in PRODUCTION where books are deep.
-MAKER_EXIT_ENABLED = MODE == "PRODUCTION"
-MAKER_EXIT_TIMEOUT_S = 45       # seconds to wait for POST_ONLY fill before MARKET fallback
+# 2026-07-12 (auditoría/piloto): DESACTIVADO. El piloto mostró que dYdX rechaza
+# las órdenes reduce-only POST_ONLY con code=9003 "Reduce-only is currently
+# disabled for non-IOC orders". El maker-exit coloca LIMIT POST_ONLY reduce_only
+# → SIEMPRE rechazadas por la cadena → espera 45s en vano → cae a taker igual.
+# Nunca funcionó en mainnet. Los TP salen ahora por MARKET IOC (slippage acotado
+# 200bps + reconciliación E3 a fills reales). El ahorro de maker (3bps/pierna)
+# no compensa 45s de latencia en una salida de mean-reversion.
+MAKER_EXIT_ENABLED = False
+MAKER_EXIT_TIMEOUT_S = 45       # (sin uso mientras MAKER_EXIT_ENABLED=False)
 
 # ===== Funding Rate Gate =====
 # Before opening a pair, check the predicted 8h funding rate for both legs.

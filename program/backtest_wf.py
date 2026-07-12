@@ -58,6 +58,8 @@ CACHE_DIR = SCRIPT_DIR / "backtest_cache"
 CACHE_DIR.mkdir(exist_ok=True)
 BARS_PER_YEAR = 24 * 365  # 1HOUR
 
+_SESSION = requests.Session()  # reutiliza conexiones (mucho más rápido)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Candles con timestamp (para alineación correcta, Q6)
@@ -77,17 +79,30 @@ def fetch_candles_ts(market, n_bars=2160, cache_max_age_h=12.0):
     out = {}
     current_to = to_dt
     base = INDEXER.rstrip("/")
-    for _ in range((n_bars // 100) + 2):
+    max_pages = (n_bars // 100) + 2
+    empty_streak = 0
+    for _ in range(max_pages):
         url = f"{base}/v4/candles/perpetualMarkets/{market}"
         params = {"resolution": "1HOUR", "limit": 100,
                   "toISO": current_to.strftime("%Y-%m-%dT%H:%M:%S.000Z")}
-        try:
-            r = requests.get(url, params=params, timeout=15)
-            r.raise_for_status()
-            candles = r.json().get("candles", [])
-        except Exception:
-            break
+        candles = None
+        # retry con backoff en 429/5xx/timeout
+        for attempt in range(4):
+            try:
+                r = _SESSION.get(url, params=params, timeout=10)
+                if r.status_code == 429 or r.status_code >= 500:
+                    time.sleep(0.6 * (2 ** attempt))
+                    continue
+                r.raise_for_status()
+                candles = r.json().get("candles", [])
+                break
+            except Exception:
+                time.sleep(0.5 * (2 ** attempt))
+                continue
         if not candles:
+            empty_streak += 1
+            if empty_streak >= 2:
+                break   # el indexer ya no tiene más historia hacia atrás
             break
         for c in candles:
             out[c["startedAt"]] = float(c["close"])
@@ -95,7 +110,7 @@ def fetch_candles_ts(market, n_bars=2160, cache_max_age_h=12.0):
         current_to = datetime.fromisoformat(oldest.replace("Z", "+00:00")) - timedelta(seconds=1)
         if current_to < from_dt:
             break
-        time.sleep(0.1)
+        time.sleep(0.05)
     if not out:
         return None
     series = sorted(out.items())  # [(ts, close)]
@@ -104,6 +119,33 @@ def fetch_candles_ts(market, n_bars=2160, cache_max_age_h=12.0):
     except Exception:
         pass
     return series
+
+
+def prefetch_markets(markets, n_bars, workers=6):
+    """
+    Descarga en paralelo (thread pool) los mercados ÚNICOS con barra de
+    progreso. Cada mercado pagina internamente en serie; el paralelismo es
+    entre mercados. Devuelve {market: series|None}.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    result = {}
+    total = len(markets)
+    done = 0
+    print(f"Descargando {total} mercados únicos (≈{(n_bars//100)+1} páginas c/u, {workers} en paralelo)...", flush=True)
+    t0 = time.time()
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = {ex.submit(fetch_candles_ts, m, n_bars): m for m in markets}
+        for fut in as_completed(futs):
+            m = futs[fut]
+            try:
+                result[m] = fut.result()
+            except Exception:
+                result[m] = None
+            done += 1
+            if done % 5 == 0 or done == total:
+                ok = sum(1 for v in result.values() if v)
+                print(f"   {done}/{total} mercados  ({ok} OK, {time.time()-t0:.0f}s)", flush=True)
+    return result
 
 
 def align_by_ts(series_1, series_2):
@@ -297,6 +339,7 @@ def main():
     ap.add_argument("--cost-bps-per-leg", type=float, default=40.0,
                     help="Coste por pierna (fee+slippage+½spread) en bps. Mainnet altcoins ~40-200.")
     ap.add_argument("--funding-bps-day", type=float, default=3.0, help="Drag de funding en bps/día")
+    ap.add_argument("--workers", type=int, default=6, help="Descargas concurrentes de candles")
     args = ap.parse_args()
 
     if not CSV_PATH.exists():
@@ -314,11 +357,21 @@ def main():
           f"hard_sl=${HARD_SL_USD} window={WINDOW}")
     print(f"{'='*72}\n")
 
-    cache = {}
+    # ── Prefetch de mercados únicos (con progreso, paralelo, backoff) ──────
+    unique_markets = set()
+    _pair_list = []
+    for _, row in pairs.iterrows():
+        m1 = str(row.get("base_market", row.get("sym_1", ""))).strip()
+        m2 = str(row.get("quote_market", row.get("sym_2", ""))).strip()
+        if m1 and m2:
+            unique_markets.add(m1)
+            unique_markets.add(m2)
+            _pair_list.append((m1, m2))
+    cache = prefetch_markets(sorted(unique_markets), args.bars, workers=args.workers)
+    print(f"Prefetch listo. Corriendo walk-forward sobre {len(_pair_list)} pares...\n", flush=True)
+
     def get(m):
-        if m not in cache:
-            cache[m] = fetch_candles_ts(m, n_bars=args.bars)
-        return cache[m]
+        return cache.get(m)
 
     all_trades = []
     folds_used = 0

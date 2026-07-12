@@ -294,12 +294,14 @@ async def main():
 
     if exch:
         print(f"\n{'─'*70}\n  CROSS-CHECK — historical-pnl del exchange (dYdX)\n{'─'*70}")
-        exch_pnl = exch['last_equity'] - exch['first_equity'] - exch['last_net_transfers']
         print(f"  Ventana:                 {exch['first_at']} → {exch['last_at']} ({exch['n_points']} pts)")
         print(f"  Equity:                  ${exch['first_equity']:,.2f} → ${exch['last_equity']:,.2f}")
-        print(f"  Net transfers:           ${exch['last_net_transfers']:,.2f}")
-        print(f"  PnL exchange (eq−transf):${exch_pnl:,.2f}")
-        print(f"  totalPnl (campo):        ${exch['last_total_pnl']:,.2f}")
+        print(f"  Net transfers (ventana): ${exch['last_net_transfers']:,.2f}")
+        print(f"  ➤ totalPnl (dYdX, autoritativo): ${exch['last_total_pnl']:,.2f}")
+        print(f"    (Este es el PnL de trading calculado por el exchange y debe")
+        print(f"     coincidir con TOTAL PnL REAL de arriba. NO uses equity−transfers:")
+        print(f"     netTransfers sólo cubre esta ventana de puntos y NO incluye")
+        print(f"     depósitos previos → daría un número inflado y falso.)")
 
     print(f"\n  Equity actual: ${equity:,.2f} | Free: ${free:,.2f}")
 

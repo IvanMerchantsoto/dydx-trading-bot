@@ -70,6 +70,15 @@ check("E2 slippage tiers ordenados",
       f"{C.MARKET_MAX_SLIPPAGE_BPS_ENTRY}/{C.MARKET_MAX_SLIPPAGE_BPS_EXIT}/"
       f"{C.MARKET_MAX_SLIPPAGE_BPS_FLATTEN}/cap{C.MARKET_SLIPPAGE_ORACLE_CAP_BPS}")
 
+# ── Universo: techo DURO de liquidez en entrada ──────────────────────────────
+check("LIQ MAX_ENTRY_LEG_SPREAD_BPS == 40", C.MAX_ENTRY_LEG_SPREAD_BPS == 40,
+      f"={C.MAX_ENTRY_LEG_SPREAD_BPS}")
+check("LIQ ceiling >= floor", C.MAX_ENTRY_LEG_SPREAD_BPS >= C.SPREAD_GATE_PER_LEG_FLOOR_BPS)
+import func_bot_agent as BA
+check("LIQ ceiling efectivo = min(config, 40)",
+      abs(BA._EFFECTIVE_ENTRY_CEILING_BPS - min(float(C.SPREAD_GATE_PER_LEG_CEILING_BPS), 40.0)) < 1e-9,
+      f"={BA._EFFECTIVE_ENTRY_CEILING_BPS}")
+
 # ── R2/R4: kill-switch persistente ───────────────────────────────────────────
 import func_kill_switch as K
 # aislar el estado en un tmp file

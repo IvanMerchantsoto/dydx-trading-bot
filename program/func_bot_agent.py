@@ -33,6 +33,14 @@ from constants import (
     SPREAD_GATE_PER_LEG_CEILING_BPS,
     MARKET_MAX_SLIPPAGE_BPS_ENTRY,
     MARKET_MAX_SLIPPAGE_BPS_FLATTEN,
+    MAX_ENTRY_LEG_SPREAD_BPS,
+)
+
+# Techo DURO de liquidez: el ceiling efectivo de entrada es el MÁS ESTRECHO
+# entre el ceiling configurado y MAX_ENTRY_LEG_SPREAD_BPS. Bloquea pares
+# ilíquidos sin importar el edge (auditoría 2026-07-12).
+_EFFECTIVE_ENTRY_CEILING_BPS = min(
+    float(SPREAD_GATE_PER_LEG_CEILING_BPS), float(MAX_ENTRY_LEG_SPREAD_BPS)
 )
 
 
@@ -245,7 +253,7 @@ class BotAgent:
                 get_market_spread_bps(self.indexer, self.market_1),
                 get_market_spread_bps(self.indexer, self.market_2),
             )
-            pf_ceiling = float(SPREAD_GATE_PER_LEG_CEILING_BPS)
+            pf_ceiling = _EFFECTIVE_ENTRY_CEILING_BPS  # techo DURO de liquidez
             pf_floor = float(SPREAD_GATE_PER_LEG_FLOOR_BPS)
             pf_max_pct = float(SPREAD_GATE_MAX_PCT_OF_EDGE)
             pf_notional = float(self.intended_usd_per_trade or 0.0)
@@ -458,7 +466,7 @@ class BotAgent:
             )
 
             floor_bps = float(SPREAD_GATE_PER_LEG_FLOOR_BPS)
-            ceiling_bps = float(SPREAD_GATE_PER_LEG_CEILING_BPS)
+            ceiling_bps = _EFFECTIVE_ENTRY_CEILING_BPS  # techo DURO de liquidez
             max_pct = float(SPREAD_GATE_MAX_PCT_OF_EDGE)
             notional_per_leg = float(self.intended_usd_per_trade or 0.0)
             edge_usd = float(self.expected_edge_usd or 0.0)

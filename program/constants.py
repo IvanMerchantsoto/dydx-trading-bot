@@ -281,6 +281,18 @@ SPREAD_GATE_PER_LEG_CEILING_BPS = 500 if MODE == "DEVELOPMENT" else 250
 # gate above. Keep here only for legacy modules that might still import it.
 MAX_ENTRY_SPREAD_BPS = SPREAD_GATE_PER_LEG_CEILING_BPS
 
+# ===== Techo DURO de liquidez en la entrada (2026-07-12, auditoría) =====
+# Bloquea el par si CUALQUIER leg tiene spread en vivo > este valor, sin importar
+# el edge (a diferencia del gate edge-proporcional, que dejaba pasar spreads
+# anchos si el edge era grande). Razón: la reconciliación real mostró que la
+# pérdida (-$60/30d = totalPnl dYdX) es 100% coste de ejecución; sólo los pares
+# cuyo book llena cerca del mid (spread ≲ cap de slippage de entrada = 40bps)
+# tienen expectativa neta viable. Pares de 80-250bps hay que EXCLUIRLOS, no
+# blacklistearlos de a uno. 40bps deja: ETH, SOL, XRP, LINK, LTC, DOT, ADA,
+# APT, AVAX, UNI, SUI (viables por calibrate_spread_ceiling) y bloquea el resto.
+# Debe ser ≥ SPREAD_GATE_PER_LEG_FLOOR_BPS. Sube/baja según liquidez observada.
+MAX_ENTRY_LEG_SPREAD_BPS = 40
+
 # Close all open positions and orders
 # PELIGRO: True cierra TODO a market price en el startup — paga taker fees por cada posición
 # y realiza cualquier pérdida latente. Solo actívalo manualmente antes de un restart de limpieza.

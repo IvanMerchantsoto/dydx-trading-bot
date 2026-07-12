@@ -159,17 +159,46 @@ def fetch_subaccount(addr):
     return equity, free, inv
 
 
-def fetch_exchange_pnl(addr):
+def fetch_exchange_hist(addr):
+    """Devuelve la lista de snapshots historical-pnl ordenada asc por createdAt."""
     resp = api("/v4/historical-pnl", {"address": addr, "subaccountNumber": 0, "limit": 1000})
     hist = resp.get("historicalPnl", []) if isinstance(resp, dict) else []
     if not hist:
+        return []
+    return sorted(hist, key=lambda h: _get(h, "createdAt", default=""))
+
+
+def period_pnl_from_hist(hist, days):
+    """
+    PnL del PERIODO = totalPnl(fin) − totalPnl(inicio), donde inicio = primer
+    snapshot con createdAt <= (ahora − days). Es la forma CORRECTA de medir el
+    PnL de un periodo: inmune a posiciones que cruzan el borde de la ventana y a
+    depósitos (totalPnl ya excluye transfers). Es la fuente de verdad.
+    """
+    if not hist:
         return None
-    hs = sorted(hist, key=lambda h: _get(h, "createdAt", default=""))
-    f, l = hs[0], hs[-1]
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    start = hist[0]
+    for h in hist:
+        ts = _get(h, "createdAt")
+        try:
+            if ts and datetime.fromisoformat(ts.replace("Z", "+00:00")) <= cutoff:
+                start = h
+            else:
+                break
+        except Exception:
+            pass
+    end = hist[-1]
     return {
-        "first_equity": _sf(_get(f, "equity")), "last_equity": _sf(_get(l, "equity")),
-        "last_total_pnl": _sf(_get(l, "totalPnl")), "last_net_transfers": _sf(_get(l, "netTransfers")),
-        "first_at": _get(f, "createdAt"), "last_at": _get(l, "createdAt"), "n_points": len(hs),
+        "start_at": _get(start, "createdAt"), "end_at": _get(end, "createdAt"),
+        "start_total_pnl": _sf(_get(start, "totalPnl")), "end_total_pnl": _sf(_get(end, "totalPnl")),
+        "start_equity": _sf(_get(start, "equity")), "end_equity": _sf(_get(end, "equity")),
+        "period_pnl": _sf(_get(end, "totalPnl")) - _sf(_get(start, "totalPnl")),
+        "n_points": len(hist),
+        "covers_full_window": (
+            datetime.fromisoformat(_get(hist[0], "createdAt").replace("Z", "+00:00")) <= cutoff
+            if _get(hist[0], "createdAt") else False
+        ),
     }
 
 
@@ -225,7 +254,8 @@ def main():
     funding_total, funding_n, _ = fetch_funding(addr, args.days)
     marks = fetch_marks()
     equity, free, inv = fetch_subaccount(addr)
-    exch = fetch_exchange_pnl(addr)
+    hist = fetch_exchange_hist(addr)
+    per = period_pnl_from_hist(hist, args.days)
 
     buy_notional = sell_notional = fees = 0.0
     net_size = defaultdict(float); cash_by_market = defaultdict(float)
@@ -251,45 +281,68 @@ def main():
     total_real_pnl = trading_pnl + funding_total
     internal_pnl, internal_n, prov_n = read_internal_pnl(log_paths, args.days)
 
-    print(f"\n{'─'*70}\n  PnL REAL (fills + funding + MtM)\n{'─'*70}")
-    print(f"  Fills procesados:        {len(fills)}")
-    print(f"  Σ sell_notional:         ${sell_notional:,.2f}")
-    print(f"  Σ buy_notional:          ${buy_notional:,.2f}")
-    print(f"  Σ fees (reales):         ${fees:,.2f}")
-    print(f"  MtM inventario abierto:  ${mtm:,.2f}  ({len(inv)} posiciones)")
-    print(f"  Funding neto:            ${funding_total:,.2f}  ({funding_n} pagos)")
-    print(f"  ──")
-    print(f"  TRADING PnL:             ${trading_pnl:,.2f}")
-    print(f"  TOTAL PnL REAL:          ${total_real_pnl:,.2f}")
+    # ── Detección de STRADDLE (posiciones que cruzan el borde de la ventana) ─
+    # Si un mercado tiene inventario neto (de fills en ventana) NO trivial pero
+    # NO figura como posición abierta real, sus fills de apertura/cierre están
+    # partidos por el borde → el PnL de caja en ventana para ese mercado es
+    # basura. Marca cuántos mercados y cuánta "caja" afectan.
+    straddle_mkts = []
+    for m, ns in net_size.items():
+        actual = inv.get(m, 0.0)
+        if abs(ns) > 1e-6 and abs(ns - actual) > 1e-6:
+            straddle_mkts.append(m)
+    straddle = len(straddle_mkts) > 0
 
+    # ══ 1. FUENTE DE VERDAD: PnL del periodo por Δ de totalPnl del exchange ══
+    print(f"\n{'═'*70}\n  ✅ PnL DEL PERIODO (AUTORITATIVO — Δ totalPnl de dYdX)\n{'═'*70}")
+    if per:
+        cov = "" if per["covers_full_window"] else "  ⚠️ el historial no cubre toda la ventana; inicio = punto más antiguo disponible"
+        print(f"  Inicio: {per['start_at']}  totalPnl=${per['start_total_pnl']:,.2f}")
+        print(f"  Fin:    {per['end_at']}  totalPnl=${per['end_total_pnl']:,.2f}")
+        print(f"  ➤ PnL del periodo (~{args.days}d): ${per['period_pnl']:+,.2f}{cov}")
+        print(f"  Equity: ${per['start_equity']:,.2f} → ${per['end_equity']:,.2f}")
+        print(f"  (totalPnl ya excluye depósitos/retiros y es inmune al straddle.)")
+    else:
+        print("  historical-pnl no disponible.")
+
+    # ══ 2. PnL interno del bot ══
     print(f"\n{'─'*70}\n  PnL INTERNO del bot (trade_closed.net_pnl_est)\n{'─'*70}")
     print(f"  Cierres contabilizados:  {internal_n}  (provisional={prov_n})")
     print(f"  Σ net_pnl_est interno:   ${internal_pnl:,.2f}")
 
-    print(f"\n{'─'*70}\n  DIVERGENCIA interno vs real\n{'─'*70}")
-    diff = internal_pnl - total_real_pnl
-    denom = abs(total_real_pnl) if abs(total_real_pnl) > 1e-9 else 1.0
-    print(f"  interno − real:          ${diff:,.2f}  ({diff/denom*100:+.1f}%)")
-    if abs(diff) > max(1.0, 0.20 * denom):
-        print(f"  ⚠️  DIVERGENCIA > 20% — la contabilidad interna NO es fiable.")
-    else:
-        print(f"  ✅ Dentro de tolerancia (20%).")
+    # ══ 3. DIVERGENCIA interno vs AUTORITATIVO ══
+    if per:
+        print(f"\n{'─'*70}\n  DIVERGENCIA interno vs autoritativo\n{'─'*70}")
+        real = per["period_pnl"]
+        diff = internal_pnl - real
+        denom = abs(real) if abs(real) > 1e-9 else 1.0
+        print(f"  interno − real:          ${diff:,.2f}  ({diff/denom*100:+.1f}%)")
+        if not per["covers_full_window"]:
+            print(f"  (Nota: el interno cuenta sólo cierres dentro de --days; si el")
+            print(f"   historial no cubre la ventana, la comparación es aproximada.)")
+        if abs(diff) > max(1.0, 0.20 * denom):
+            print(f"  ⚠️  DIVERGENCIA > 20% — la contabilidad interna aún no refleja el PnL real.")
+        else:
+            print(f"  ✅ Dentro de tolerancia (20%).")
 
-    if exch:
-        print(f"\n{'─'*70}\n  CROSS-CHECK — historical-pnl del exchange (dYdX)\n{'─'*70}")
-        print(f"  Ventana:                 {exch['first_at']} → {exch['last_at']} ({exch['n_points']} pts)")
-        print(f"  Equity:                  ${exch['first_equity']:,.2f} → ${exch['last_equity']:,.2f}")
-        print(f"  ➤ totalPnl (dYdX, autoritativo): ${exch['last_total_pnl']:,.2f}")
-        print(f"    (Debe coincidir con TOTAL PnL REAL. NO uses equity−transfers:")
-        print(f"     netTransfers no incluye depósitos previos → número inflado.)")
+    # ══ 4. Método por fills en ventana (SECUNDARIO — sólo válido si plano) ══
+    print(f"\n{'─'*70}\n  [diagnóstico] PnL por fills en ventana (NO fiable con straddle)\n{'─'*70}")
+    print(f"  Fills: {len(fills)}  sell=${sell_notional:,.2f} buy=${buy_notional:,.2f} "
+          f"fees=${fees:,.2f} funding=${funding_total:,.2f}")
+    print(f"  MtM inventario real: ${mtm:,.2f} ({len(inv)} pos)  →  TRADING PnL ventana: ${trading_pnl:,.2f}")
+    if straddle:
+        print(f"  ⚠️  STRADDLE en {len(straddle_mkts)} mercados {straddle_mkts[:6]}: sus fills de")
+        print(f"      apertura/cierre cruzan el borde de la ventana → este número y el TOP")
+        print(f"      de abajo NO son fiables. Usa el PnL del periodo (bloque 1).")
 
-    print(f"\n  Equity actual: ${equity:,.2f} | Free: ${free:,.2f}")
+    print(f"\n  Equity actual: ${equity:,.2f} | Free: ${free:,.2f}  | posiciones abiertas: {len(inv)}")
 
-    losers = sorted(cash_by_market.items(), key=lambda kv: kv[1])[:10]
-    if losers:
-        print(f"\n{'─'*70}\n  TOP 10 mercados por PnL de caja neteado (incl. MtM y fees)\n{'─'*70}")
-        for m, v in losers:
-            print(f"    {m:<16} ${v:,.2f}   (inv abierto: {net_size.get(m,0):+.4f})")
+    if not straddle:
+        losers = sorted(cash_by_market.items(), key=lambda kv: kv[1])[:10]
+        if losers:
+            print(f"\n{'─'*70}\n  TOP 10 mercados por PnL de caja neteado\n{'─'*70}")
+            for m, v in losers:
+                print(f"    {m:<16} ${v:,.2f}   (inv: {net_size.get(m,0):+.4f})")
     print()
 
 

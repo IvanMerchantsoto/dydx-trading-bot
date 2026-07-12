@@ -41,9 +41,8 @@ MIN_PROFIT_USD = 0.30
 DROP_STALE_RECORDS = True
 
 USE_Z_TP = True
-Z_TP = 0.4           # 2026-07-10: 0.7 → 0.4. Backtest_conservative valida +$722/mo.
-                     # Cierra más rápido en profit, aumenta frecuencia trade.
-                     # Compensa HARD_SL más chico ($2.50).
+Z_TP = 0.7           # 2026-07-12: 0.4 → 0.7. Vuelta a Jun 30 style. TP más fácil disparar.
+                     # Con notionals chicos, mejor cerrar rápido que esperar convergencia total.
 
 USE_Z_SL = True
 Z_SL_DELTA = 1.5     # SL cuando abs(z_now) >= abs(z_entry) + 1.5
@@ -190,9 +189,9 @@ DYNAMIC_SIZING = True
 #   - Mejor Sharpe ratio esperado
 #   - Cada trade contribuye menos al riesgo total
 # Ratio fees/edge se mantiene igual (escalan juntos).
-DYNAMIC_SIZING_PCT = 0.10         # 10% of equity per leg  → $64 con $641
-DYNAMIC_SIZING_MIN_USD = 40.0     # floor: $40/leg
-DYNAMIC_SIZING_MAX_USD = 80.0     # cap:   $80/leg (redondeo step $8)
+DYNAMIC_SIZING_PCT = 0.05         # 2026-07-12: 10% → 5%. Notionals chicos = menos $ en riesgo.
+DYNAMIC_SIZING_MIN_USD = 20.0     # 2026-07-12: 40 → 20. Piso Jun 30 style.
+DYNAMIC_SIZING_MAX_USD = 40.0     # 2026-07-12: 80 → 40. Con $600 equity: 5%=$30/leg.
 # Cuando subas a $500 de equity y quieras escalar:
 #   DYNAMIC_SIZING_PCT = 0.20
 #   DYNAMIC_SIZING_MIN_USD = 50.0
@@ -334,7 +333,7 @@ ZSCORE_THRESH = 2.7    # 2026-05-22: bajado de 3.0 a 2.7 tras backtest OOS compa
                        # Trade marginal entre 2.7→2.5 baja a EV=$9.79 con PF degradando — no vale el churn.
                        # ZSCORE_THRESH anterior fijo en 3.0 capturaba solo 8% de escaneos vs ~20% con 2.7
                        # (en log del bot 2026-05-19/22). 2.5× más oportunidades, mismo nivel de calidad.
-USD_PER_TRADE = 65           # 2026-07-06: fallback si dynamic falla. $65/leg (config $641 equity).
+USD_PER_TRADE = 30           # 2026-07-12: 65 → 30. Jun 30 style. Notional pair ~$60.
 USD_MIN_COLLATERAL = 150     # 2026-07-10: 70 → 150. Bot pausa nuevas entries
                               # si free < $150. Con equity $612 esto deja abrir
                               # hasta ~7-8 pares antes de tocar el gate.

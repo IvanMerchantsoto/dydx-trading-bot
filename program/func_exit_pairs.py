@@ -562,15 +562,42 @@ async def manage_trade_exits(node, indexer, wallet):
         #
         # Threshold de ±0.1 evita disparar por ruido cerca de z=0 cuando
         # el spread oscila justo en la media.
-        # ── 2b. TP_CROSSED_ZERO — DESACTIVADO 2026-07-10 ────────────────────
-        # Diagnóstico: los TPs por zero-crossing cerraban trades DEMASIADO
-        # RÁPIDO (avg winner $0.42 vs backtest $2.97). Con HARD_SL de $8, el
-        # ratio W:L era 1:19 — fatal.
-        # Backtest_conservative con Z_TP=0.4 + HARD_SL=$2.5 + sin
-        # zero-crossing → +$722 net, drawdown solo -$33.
-        # Reactivar solo si backtest lo justifica en el futuro.
-        if False:  # bloque completamente inactivo
-            pass
+        # ── 2b. TP_CROSSED_ZERO — RE-HABILITADO con GATE RELAJADO 2026-07-12 ──
+        # Jun 30 tuvo su noche rentable gracias a este mecanismo. Bug de Jun 30:
+        # el gate ok_profit (requiere >= MIN_PROFIT_USD + fees) bloqueaba cierres
+        # cuando pnl era chico pero POSITIVO. Ejemplo: pnl=$0.20, gate requiere
+        # $0.30+ → bot esperaba más, luego el spread revertía a pérdida.
+        #
+        # FIX 2026-07-12: para TP_CROSSED_ZERO, solo requerir net_pnl_est > 0
+        # (cubrir fees + slippage). Sin gate estricto de MIN_PROFIT.
+        # Rationale: si el z cruzó cero, la tesis se cumplió — capturar lo que
+        # haya de profit antes que el spread revierta.
+        if (not is_close) and USE_Z_TP and (z_now is not None):
+            zero_crossed = (
+                (z_entry >  0.1 and z_now < -0.1) or
+                (z_entry < -0.1 and z_now >  0.1)
+            )
+            zc_net_positive = (
+                zero_crossed and can_pnl and
+                (net_pnl_est is not None) and (net_pnl_est > 0)
+            )
+            if zc_net_positive:
+                is_close = True
+                close_reason = (
+                    f"TP_CROSSED_ZERO: z_entry={z_entry:.3f} → z_now={z_now:.3f} "
+                    f"| pnl_gross={pnl_gross:.2f} | net_est={net_pnl_est:.2f} "
+                    f"(relaxed gate: net>0)"
+                )
+                log_event({
+                    "type": "tp_zero_crossing_trigger",
+                    "trace_id": trace_id,
+                    "m1": m1, "m2": m2,
+                    "z_entry": round(z_entry, 4),
+                    "z_now": round(z_now, 4),
+                    "pnl_gross": round(pnl_gross, 4),
+                    "net_est": round(net_pnl_est, 4),
+                    "gate_used": "relaxed_net_positive",
+                })
 
         # ── 3. Take-Profit (z reversion + confirmation + fee gate) ──────────
         # Trailing TP: sigue el spread hasta su peak y cierra en el pullback.
@@ -666,62 +693,24 @@ async def manage_trade_exits(node, indexer, wallet):
                             f"| min_gross={min_gross_required:.2f}"
                         )
                     elif pnl_gross < 0.0:
-                        # ── 2026-07-11 RE-ENABLED TP_MEAN_REVERTED (con gate estricto) ──
-                        # Contexto: bot en Jun 30 no cerraba con pnl_gross<0. Observado
-                        # tp_confirm=916 (8+ horas intentando cerrar) mientras spread
-                        # revertía perfecto (best_z=0.02) pero pnl estaba en -$0.88.
-                        # Sin acción, se queda hasta HARD_SL a -$2.60.
-                        #
-                        # Nueva regla estricta: si best_z <= Z_TP (spread realmente
-                        # revirtió) Y pérdida entre -$0.50 y 0 (fees + slippage),
-                        # aceptar el close en -$0.50. Peor caso -$0.50 << HARD_SL -$2.60.
-                        #
-                        # DIFERENCIAS con la versión Jul 3 (que reveramos):
-                        #  - MAX_LOSS $0.50 (era $1.60)  ← 3x más estricto
-                        #  - Requiere best_z REALMENTE cerca de 0 (0.5 clamp)
-                        #  - Requiere age >= 60min (evita whipsaw temprano)
-                        TP_MEAN_REVERTED_MAX_LOSS = -0.50
-                        MIN_AGE_FOR_MEAN_REV_LOSS_MIN = 60.0
-                        BEST_Z_MEAN_REV_MAX = 0.5
-                        best_z_val = _sf(position.get("best_z", abs(z_now) + 99.0))
-                        age_ok = (age_min is not None and age_min >= MIN_AGE_FOR_MEAN_REV_LOSS_MIN)
-                        loss_ok = (pnl_gross >= TP_MEAN_REVERTED_MAX_LOSS)
-                        reverted_ok = (best_z_val <= BEST_Z_MEAN_REV_MAX)
-
-                        if age_ok and loss_ok and reverted_ok:
-                            is_close = True
-                            close_reason = (
-                                f"TP_MEAN_REVERTED: best_z={best_z_val:.3f} "
-                                f"(spread reverted), z_now={z_now:.3f}, "
-                                f"age={age_min:.0f}min, pnl_gross={pnl_gross:.3f} "
-                                f"(accepting small loss to avoid HARD_SL degradation)"
-                            )
-                            log_event({
-                                "type": "tp_mean_reverted",
-                                "trace_id": trace_id,
-                                "m1": m1, "m2": m2,
-                                "pnl_gross": round(pnl_gross, 4),
-                                "best_z": round(best_z_val, 4),
-                                "z_now": round(z_now, 4),
-                                "age_min": round(age_min, 1) if age_min else None,
-                            })
-                        else:
-                            tp_blocked_profit_count += 1
-                            log_event({
-                                "type": "tp_blocked_loss",
-                                "trace_id": trace_id,
-                                "m1": m1, "m2": m2,
-                                "pnl_gross": pnl_gross,
-                                "net_est": net_pnl_est,
-                                "z_now": z_now,
-                                "z_entry": z_entry,
-                                "best_z": best_z_val,
-                                "gate_failed": (
-                                    "age" if not age_ok else
-                                    ("loss_too_big" if not loss_ok else
-                                     ("best_z_not_reverted" if not reverted_ok else "unknown"))
-                                ),
-                            }, print_terminal=False)
+                        # ── 2026-07-12 TP_MEAN_REVERTED DESACTIVADO ──────────
+                        # Fase 1 revert al Jun 30 style. Si pnl_gross<0 y z
+                        # revirtió → HOLD hasta HARD_SL o rebote.
+                        # Razón: TP_MEAN_REVERTED con market order en pares
+                        # ilíquidos daba slippage catastrófico (-$6 real vs
+                        # -$0.47 esperado). Con blacklist activa, este riesgo
+                        # baja mucho, pero por seguridad Jun 30 style es HOLD.
+                        tp_blocked_profit_count += 1
+                        log_event({
+                            "type": "tp_blocked_loss",
+                            "trace_id": trace_id,
+                            "m1": m1, "m2": m2,
+                            "pnl_gross": pnl_gross,
+                            "net_est": net_pnl_est,
+                            "z_now": z_now,
+                            "z_entry": z_entry,
+                            "policy": "hold_until_hard_sl_or_rebound_jun30",
+                        }, print_terminal=False)
                     else:
                         # pnl_gross > 0 but not enough to cover fees + min net profit yet.
                         # Keep waiting — the spread might improve further.

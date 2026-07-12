@@ -8,6 +8,7 @@
 program/bot_agents.json
 program/pair_fail_cooldowns.json
 program/risk_state.json
+program/pnl_baseline.json
 program/bot_run.log.jsonl
 program/bot_out.log
 bot_stdout.log

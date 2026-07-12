@@ -239,8 +239,48 @@ def main():
     ap.add_argument("--log", action="append", default=None)
     ap.add_argument("--address", default=DEFAULT_ADDRESS, help="Dirección dYdX (default: la de constants.py)")
     ap.add_argument("--indexer", default=DEFAULT_INDEXER, help="URL del indexer")
+    ap.add_argument("--mark", action="store_true",
+                    help="Marca la línea base AHORA (totalPnl+ts en pnl_baseline.json) y sale.")
+    ap.add_argument("--since-baseline", action="store_true",
+                    help="Mide el PnL desde la línea base marcada con --mark (inmune a straddle/depósitos).")
     args = ap.parse_args()
     BASE = args.indexer.rstrip("/")
+    addr = (args.address or "").strip()
+
+    baseline_path = SCRIPT_DIR / "pnl_baseline.json"
+
+    if args.mark:
+        hist = fetch_exchange_hist(addr)
+        if not hist:
+            print("No pude leer historical-pnl para marcar la base.")
+            return
+        last = hist[-1]
+        base = {"ts": _get(last, "createdAt"), "total_pnl": _sf(_get(last, "totalPnl")),
+                "equity": _sf(_get(last, "equity"))}
+        json.dump(base, open(baseline_path, "w"), indent=2)
+        print(f"\n✅ Línea base marcada: totalPnl=${base['total_pnl']:,.2f}  equity=${base['equity']:,.2f}")
+        print(f"   ts={base['ts']}\n   Corre `reconcile_pnl.py --since-baseline` en unos días.\n")
+        return
+
+    if args.since_baseline:
+        if not baseline_path.exists():
+            print("No hay pnl_baseline.json. Corre primero `reconcile_pnl.py --mark`.")
+            return
+        base = json.load(open(baseline_path))
+        hist = fetch_exchange_hist(addr)
+        _eq, _free, inv = fetch_subaccount(addr)
+        if not hist:
+            print("historical-pnl no disponible.")
+            return
+        now_tp = _sf(_get(hist[-1], "totalPnl"))
+        delta = now_tp - _sf(base.get("total_pnl"))
+        print(f"\n{'═'*70}\n  PnL DESDE LA LÍNEA BASE (Δ totalPnl, código post-fix)\n{'═'*70}")
+        print(f"  Base:  {base.get('ts')}  totalPnl=${_sf(base.get('total_pnl')):,.2f}")
+        print(f"  Ahora: {_get(hist[-1],'createdAt')}  totalPnl=${now_tp:,.2f}")
+        print(f"  ➤ PnL desde la base: ${delta:+,.2f}")
+        print(f"  Posiciones abiertas ahora: {len(inv)}   Equity: ${_eq:,.2f}\n")
+        return
+
     log_paths = args.log or [str(SCRIPT_DIR / "bot_run.log.jsonl"),
                              str(SCRIPT_DIR / "logs" / "bot_run.log.jsonl")]
     addr = (args.address or "").strip()

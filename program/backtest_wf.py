@@ -430,6 +430,18 @@ def main():
             pass
 
     m = metrics(all_trades, args.usd, years)
+    # ── Aviso de SUPERVIVENCIA (los ilíquidos sin historia quedan fuera) ──
+    n_unique = len(unique_markets)
+    n_ok = sum(1 for v in cache.values() if v)
+    n_dropped = n_unique - n_ok
+    print(f"  Mercados únicos CSV:     {n_unique}")
+    print(f"  Con datos suficientes:   {n_ok}   (descartados: {n_dropped})")
+    if n_unique and n_dropped / n_unique > 0.30:
+        print(f"  ⚠️  SESGO DE SUPERVIVENCIA: {n_dropped}/{n_unique} mercados ({100*n_dropped/n_unique:.0f}%)")
+        print(f"      sin {args.bars}h de historia → EXCLUIDOS del backtest. Son en su")
+        print(f"      mayoría los altcoins ilíquidos que más slippage generan en vivo.")
+        print(f"      El resultado refleja sólo a los SUPERVIVIENTES líquidos. Baja --bars")
+        print(f"      (p.ej. 720) para incluir más del universo real que opera el bot.")
     print(f"  Pares con datos:         {pairs_run}")
     print(f"  Selecciones (folds OK):  {selections}")
     print(f"  Folds con trades:        {folds_used}")
@@ -450,7 +462,26 @@ def main():
     print(f"  Sharpe (anual):    {m['sharpe_annual']}   ← anualizado correcto (no ×√n_trades)")
     print(f"  Avg hold:          {m['avg_hold_h']}h")
     print(f"  Cierres:           {m['reasons_pct']}")
-    print(f"\n  Veredicto: {'✅ EV NETO > 0 OOS con costes' if m['net_pnl'] > 0 and m['ev_per_trade'] > 0 else '🛑 EV NETO ≤ 0 OOS — no desplegar'}")
+
+    # ── Coste de BREAK-EVEN: a qué bps/pierna el EV neto se vuelve 0 ───────
+    # gross/trade se captura al MID; el coste real de ejecución (spread+slippage
+    # cruzando el book con IOC) suele ser MUCHO mayor que el modelado.
+    if m["n"] > 0:
+        gross_per_trade = m["gross_pnl"] / m["n"]
+        be_bps = gross_per_trade / (4.0 * args.usd) * 10_000.0
+        print(f"\n  Coste de BREAK-EVEN: ≈{be_bps:.0f} bps/pierna "
+              f"(por encima de esto el EV neto es NEGATIVO).")
+        print(f"  Estás modelando {args.cost_bps_per_leg:.0f} bps/pierna. Tu universo real")
+        print(f"  (altcoins mainnet) tiene spreads de 40-200 bps → corre también")
+        print(f"  --cost-bps-per-leg {int(be_bps)+10} y 150 para ver la sensibilidad.")
+
+    verdict_ok = m['net_pnl'] > 0 and m['ev_per_trade'] > 0
+    print(f"\n  Veredicto (a {args.cost_bps_per_leg:.0f}bps): "
+          f"{'✅ EV NETO > 0 OOS' if verdict_ok else '🛑 EV NETO ≤ 0 OOS — no desplegar'}")
+    print(f"  ⚠️  RECORDATORIO: el gross se captura al MID con ejecución perfecta")
+    print(f"      (sin legging ni whipsaw de 30s). La verdad es la reconciliación de")
+    print(f"      fills reales (reconcile_pnl.py), no este backtest. Úsalo sólo para")
+    print(f"      sensibilidad al coste y comparar parámetros, NO como prueba de GO.")
     print()
 
 

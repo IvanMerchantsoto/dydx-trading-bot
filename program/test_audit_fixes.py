@@ -81,7 +81,10 @@ check("LIQ ceiling efectivo = min(config, 40)",
 
 # ── R2/R4: kill-switch persistente ───────────────────────────────────────────
 import func_kill_switch as K
-# aislar el estado en un tmp file
+# aislar el estado en un tmp file Y silenciar log_event para NO contaminar el
+# log de producción con eventos kill_switch_triggered de prueba (se veían en
+# pilot_check con high-water $600/$560 que eran de estos tests).
+K.log_event = lambda *a, **k: None
 _tmp = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
 _tmp.close()
 K.STATE_PATH = _tmp.name

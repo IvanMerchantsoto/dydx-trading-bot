@@ -797,13 +797,34 @@ async def manage_trade_exits(node, indexer, wallet):
                 close_type_m1 = res_m1.get("close_type", "taker_fallback")
                 close_type_m2 = res_m2.get("close_type", "taker_fallback")
 
+                # E3 fix (ruta maker): recomputar pnl_gross con el precio REAL
+                # de cierre cuando el maker llenó (trae avg_price). Los TP salen
+                # por aquí, así que sin esto el pnl_gross de los TP se quedaba en
+                # precio oráculo. Las piernas que cayeron a taker_fallback no
+                # traen avg_price → se conserva el oráculo para esa pierna.
+                _mpx1 = _sf(res_m1.get("avg_price"), 0.0)
+                _mpx2 = _sf(res_m2.get("avg_price"), 0.0)
+                if can_pnl and _mpx1 > 0 and _mpx2 > 0:
+                    _po = pnl_gross
+                    pnl_gross = (leg_pnl(entry1_side, entry1_price, _mpx1, entry1_size)
+                                 + leg_pnl(entry2_side, entry2_price, _mpx2, entry2_size))
+                    log_event({
+                        "type": "pnl_gross_reconciled_to_fills",
+                        "trace_id": trace_id, "market_1": m1, "market_2": m2,
+                        "close_path": "maker",
+                        "pnl_gross_oracle": round(_po, 4),
+                        "pnl_gross_real_fills": round(pnl_gross, 4),
+                        "close_px_1": _mpx1, "close_px_2": _mpx2,
+                        "slippage_delta": round(pnl_gross - _po, 4),
+                    }, print_terminal=False)
+
                 # Accumulate real fees if available from maker fills
                 actual_close_fees = (
                     _sf(res_m1.get("fee_est", 0.0)) + _sf(res_m2.get("fee_est", 0.0))
                 )
                 if actual_close_fees > 0:
                     close_fees_est = actual_close_fees
-                    net_pnl_est = pnl_gross - (open_fees_paid + close_fees_est)
+                net_pnl_est = pnl_gross - (open_fees_paid + close_fees_est)
 
             else:
                 # ── SL / HARD_SL / TP-without-maker: MARKET IOC for speed ──

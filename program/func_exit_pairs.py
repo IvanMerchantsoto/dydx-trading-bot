@@ -14,6 +14,7 @@ from constants import (
     MIN_HOLD_MINUTES_FOR_TP,
     TRAIL_TP_ENABLED, TRAIL_Z_PULLBACK, TRAIL_Z_FLOOR,
     SL_COOLDOWN_ENABLED, SL_COOLDOWN_MIN_HOURS, SL_COOLDOWN_HALFLIFE_MULT,
+    MARKET_MAX_SLIPPAGE_BPS_EXIT, MARKET_MAX_SLIPPAGE_BPS_FLATTEN,
 )
 from func_utils import format_number
 from func_public import get_candles_recent
@@ -224,7 +225,8 @@ async def _close_single_live_leg(node, indexer, wallet, markets, market, live_si
         close_size,
         markets[market]["oraclePrice"],
         True,
-        time_in_force_type=Order.TimeInForce.TIME_IN_FORCE_IOC
+        time_in_force_type=Order.TimeInForce.TIME_IN_FORCE_IOC,
+        max_slippage_bps=MARKET_MAX_SLIPPAGE_BPS_FLATTEN,
     )
 
     log_event({
@@ -809,14 +811,16 @@ async def manage_trade_exits(node, indexer, wallet):
                     node, indexer, wallet,
                     m1, close_side_m1, close_size_m1, markets[m1]["oraclePrice"],
                     True,
-                    time_in_force_type=Order.TimeInForce.TIME_IN_FORCE_IOC
+                    time_in_force_type=Order.TimeInForce.TIME_IN_FORCE_IOC,
+                    max_slippage_bps=MARKET_MAX_SLIPPAGE_BPS_EXIT,
                 )
                 await asyncio.sleep(0.5)
                 _close_res_m2 = await place_market_order(
                     node, indexer, wallet,
                     m2, close_side_m2, close_size_m2, markets[m2]["oraclePrice"],
                     True,
-                    time_in_force_type=Order.TimeInForce.TIME_IN_FORCE_IOC
+                    time_in_force_type=Order.TimeInForce.TIME_IN_FORCE_IOC,
+                    max_slippage_bps=MARKET_MAX_SLIPPAGE_BPS_EXIT,
                 )
                 # Bug #7: capture client_ids so we can poll real fees after the close
                 _close_cid_m1 = (_close_res_m1 or {}).get("order", {}).get("id")
@@ -829,9 +833,32 @@ async def manage_trade_exits(node, indexer, wallet):
                         _det_m2 = await get_real_fill_details(indexer, _close_cid_m2, m2, max_fill_lookback=50)
                         _real_fee_close = _sf(_det_m1.get("fee_total", 0.0)) + _sf(_det_m2.get("fee_total", 0.0))
                         _close_fee_estimated = bool(_det_m1.get("fee_estimated", True)) or bool(_det_m2.get("fee_estimated", True))
+
+                        # E3 fix: recomputar pnl_gross con el PRECIO REAL de cierre
+                        # (con slippage) en lugar del oráculo. Cierra el círculo de
+                        # verdad: entrada = fill real (avg_entry_price), salida = fill
+                        # real. Así net_pnl_est refleja el slippage de ambos extremos.
+                        _cpx_m1 = _sf(_det_m1.get("avg_price"), 0.0)
+                        _cpx_m2 = _sf(_det_m2.get("avg_price"), 0.0)
+                        if can_pnl and _cpx_m1 > 0 and _cpx_m2 > 0:
+                            _pnl1_real = leg_pnl(entry1_side, entry1_price, _cpx_m1, entry1_size)
+                            _pnl2_real = leg_pnl(entry2_side, entry2_price, _cpx_m2, entry2_size)
+                            _pnl_gross_oracle = pnl_gross
+                            pnl_gross = _pnl1_real + _pnl2_real
+                            log_event({
+                                "type": "pnl_gross_reconciled_to_fills",
+                                "trace_id": trace_id,
+                                "market_1": m1, "market_2": m2,
+                                "pnl_gross_oracle": round(_pnl_gross_oracle, 4),
+                                "pnl_gross_real_fills": round(pnl_gross, 4),
+                                "close_px_1": _cpx_m1, "close_px_2": _cpx_m2,
+                                "slippage_delta": round(pnl_gross - _pnl_gross_oracle, 4),
+                            }, print_terminal=False)
+
                         if _real_fee_close > 0:
                             close_fees_est = _real_fee_close
-                            net_pnl_est = pnl_gross - (open_fees_paid + close_fees_est)
+                        net_pnl_est = pnl_gross - (open_fees_paid + close_fees_est)
+                        if _real_fee_close > 0:
                             # If neither side is estimated and open also had real fees → no longer provisional
                             if not _close_fee_estimated and not fee_estimated_at_open:
                                 pnl_provisional = False
@@ -895,7 +922,8 @@ async def manage_trade_exits(node, indexer, wallet):
                                 res_m, res_side, res_sz,
                                 markets[res_m]["oraclePrice"],
                                 True,
-                                time_in_force_type=Order.TimeInForce.TIME_IN_FORCE_IOC
+                                time_in_force_type=Order.TimeInForce.TIME_IN_FORCE_IOC,
+                                max_slippage_bps=MARKET_MAX_SLIPPAGE_BPS_FLATTEN,
                             )
                             log_event({
                                 "type": "post_close_retry_sent",

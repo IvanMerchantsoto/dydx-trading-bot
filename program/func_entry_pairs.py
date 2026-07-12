@@ -7,6 +7,7 @@ from constants import (
     MIN_EDGE_FEE_MULTIPLE,
     MARKET_BLACKLIST,
     HEDGE_RATIO_LOG_MAX,
+    MAX_TRADES_PER_MARKET,
 )
 from func_utils import format_number
 from func_public import get_candles_recent, get_market_spread_bps, get_funding_rates
@@ -39,12 +40,11 @@ PAIR_FAIL_RESET_ON_SUCCESS = True   # resetear contador si hay LIVE
 # Evita que ARKM-USD (presente en 9+ pares del CSV) bloquee todas las señales
 # en cuanto 1 par con ARKM está abierto.
 #
-# 2026-05-26: subido de 1 → 2. Análisis del log mostró que MAX=1 combinado con
-# 13 pares manuales del usuario filtraba 47 de 144 pares del CSV (33%).
-# MAX=2 permite mejor utilización del universe pero introduce correlación:
-# si SOL-USD aparece en 2 pares activos, un movimiento adverso en SOL pega
-# en ambos a la vez. Riesgo monitoreado via HARD_SL_USD por par.
-MAX_TRADES_PER_MARKET = 2
+# 2026-05-26: subido de 1 → 2 para mejor utilización del universe.
+# 2026-07-11 (auditoría R3): revertido a 1 vía constants.MAX_TRADES_PER_MARKET.
+# Permitir el mismo mercado en 2 pares introduce correlación (un movimiento
+# adverso pega en ambos a la vez). Se importa de constants para control central.
+# (MAX_TRADES_PER_MARKET ahora viene del import de constants arriba.)
 
 # ── Runtime NaN cache (2026-06-02) ────────────────────────────────────────────
 # Pairs cuyo z-score devolvió NaN se acumulan aquí. El pre-filter del CSV los
@@ -855,8 +855,19 @@ async def open_positions(
             bot_open_dict["opened_at"] = bot_open_dict.get("opened_at") or now_iso
             bot_open_dict["side_1"] = bot_open_dict.get("side_1") or base_side
             bot_open_dict["side_2"] = bot_open_dict.get("side_2") or quote_side
-            bot_open_dict["price_1"] = bot_open_dict.get("price_1") or cand["base_price"]
-            bot_open_dict["price_2"] = bot_open_dict.get("price_2") or cand["quote_price"]
+            # E3 fix: precio de entrada = fill REAL promedio (con slippage),
+            # no el oráculo del escaneo. Así el PnL de salida se calcula sobre
+            # el precio realmente pagado. Fallback al oráculo si no hubo avg.
+            bot_open_dict["price_1"] = (
+                bot_open_dict.get("price_1")
+                or _sf(bot_open_dict.get("avg_entry_price_1"), 0.0)
+                or cand["base_price"]
+            )
+            bot_open_dict["price_2"] = (
+                bot_open_dict.get("price_2")
+                or _sf(bot_open_dict.get("avg_entry_price_2"), 0.0)
+                or cand["quote_price"]
+            )
             bot_open_dict["size_1"] = bot_open_dict.get("size_1") or _sf(bot_open_dict.get("filled_size_1"), _sf(cand["base_size_fmt"]))
             bot_open_dict["size_2"] = bot_open_dict.get("size_2") or _sf(bot_open_dict.get("filled_size_2"), _sf(cand["quote_size_fmt"]))
             bot_open_dict["entry_score"] = round(cand["score"], 4)  # for future analysis

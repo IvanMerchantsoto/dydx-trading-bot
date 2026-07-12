@@ -32,6 +32,7 @@ from constants import (
     RISK_SCORE_W_UNREAL_PNL,
     RISK_OFF_MIN_AGE_HOURS,
     TAKER_FEE_BPS,
+    MARKET_MAX_SLIPPAGE_BPS_EXIT,
 )
 from func_public import get_candles_recent
 from func_cointegration import calculate_zscore
@@ -311,13 +312,15 @@ async def risk_off_close_worst_pair(node, indexer, wallet):
         await place_market_order(
             node, indexer, wallet,
             m1, side_m1, qty_m1, markets[m1]["oraclePrice"],
-            True, time_in_force_type=Order.TimeInForce.TIME_IN_FORCE_IOC
+            True, time_in_force_type=Order.TimeInForce.TIME_IN_FORCE_IOC,
+            max_slippage_bps=MARKET_MAX_SLIPPAGE_BPS_EXIT,
         )
         await asyncio.sleep(0.5)
         await place_market_order(
             node, indexer, wallet,
             m2, side_m2, qty_m2, markets[m2]["oraclePrice"],
-            True, time_in_force_type=Order.TimeInForce.TIME_IN_FORCE_IOC
+            True, time_in_force_type=Order.TimeInForce.TIME_IN_FORCE_IOC,
+            max_slippage_bps=MARKET_MAX_SLIPPAGE_BPS_EXIT,
         )
 
         # Remove closed pair from JSON (atomic)

@@ -31,6 +31,8 @@ from constants import (
     SPREAD_GATE_MAX_PCT_OF_EDGE,
     SPREAD_GATE_PER_LEG_FLOOR_BPS,
     SPREAD_GATE_PER_LEG_CEILING_BPS,
+    MARKET_MAX_SLIPPAGE_BPS_ENTRY,
+    MARKET_MAX_SLIPPAGE_BPS_FLATTEN,
 )
 
 
@@ -329,7 +331,11 @@ class BotAgent:
             prep_p1 = self._prepare_price(self.base_side, self.base_price)
             prep_p2 = self._prepare_price(self.quote_side, self.quote_price)
 
-            prep1_task = place_limit_order(
+            # E1 fix: envío SERIALIZADO (no asyncio.gather). Dos broadcasts
+            # concurrentes desde la misma cuenta Cosmos colisionan en el
+            # sequence → una pierna rechazada → legging. Secuencial + gestión
+            # local del sequence (func_private) evita la colisión.
+            prep1 = await place_limit_order(
                 self.node,
                 self.indexer,
                 wallet,
@@ -342,7 +348,7 @@ class BotAgent:
                 good_til_blocks=self.prepare_good_til_blocks,
             )
 
-            prep2_task = place_limit_order(
+            prep2 = await place_limit_order(
                 self.node,
                 self.indexer,
                 wallet,
@@ -355,8 +361,6 @@ class BotAgent:
                 good_til_blocks=self.prepare_good_til_blocks,
             )
 
-            prep1, prep2 = await asyncio.gather(prep1_task, prep2_task)
-
             if not prep1 or not prep2:
                 raise Exception(f"Prepare failed: prep1={prep1}, prep2={prep2}")
 
@@ -366,7 +370,8 @@ class BotAgent:
             if not cid1 or not cid2:
                 raise Exception(f"Prepare missing ids: cid1={cid1}, cid2={cid2}")
 
-            # Confirmar que ambas existen en indexer
+            # Confirmar que ambas existen en indexer (lecturas, sin riesgo de
+            # sequence — se pueden paralelizar sin problema).
             ok1_task = wait_order_visible(self.indexer, cid1, max_wait_s=self.prepare_visible_timeout_s)
             ok2_task = wait_order_visible(self.indexer, cid2, max_wait_s=self.prepare_visible_timeout_s)
             ok1, ok2 = await asyncio.gather(ok1_task, ok2_task)
@@ -543,33 +548,38 @@ class BotAgent:
         # =========================================================
         # PHASE 2: COMMIT
         # =========================================================
-        # Disparamos ambas MARKET IOC casi al mismo tiempo.
+        # E1 fix: envío SERIALIZADO con retry de la pierna rechazada.
+        # Antes se usaba asyncio.gather → dos broadcasts concurrentes desde la
+        # misma cuenta colisionaban en el sequence → una pierna rechazada →
+        # legging. Ahora enviamos m1, luego m2; si la cadena rechaza una (p.ej.
+        # sequence mismatch), place_market_order re-sincroniza y reintentamos
+        # una vez. Slippage acotado (ENTRY): si no llena tight, mejor NO entrar.
+        async def _commit_leg(market, side, size, ref_price):
+            res = await place_market_order(
+                self.node, self.indexer, wallet,
+                market, side, size, ref_price, False,
+                time_in_force_type=Order.TimeInForce.TIME_IN_FORCE_IOC,
+                max_slippage_bps=MARKET_MAX_SLIPPAGE_BPS_ENTRY,
+            )
+            if res is None or res.get("rejected"):
+                # Sequence ya re-sincronizado dentro de place_market_order.
+                log_event({
+                    "type": "commit_leg_retry",
+                    "trace_id": self.trace_id,
+                    "market": market,
+                    "first_result": (res or {}).get("order", {}).get("status", "none"),
+                }, print_terminal=False)
+                res = await place_market_order(
+                    self.node, self.indexer, wallet,
+                    market, side, size, ref_price, False,
+                    time_in_force_type=Order.TimeInForce.TIME_IN_FORCE_IOC,
+                    max_slippage_bps=MARKET_MAX_SLIPPAGE_BPS_ENTRY,
+                )
+            return res
+
         try:
-            m1_task = place_market_order(
-                self.node,
-                self.indexer,
-                wallet,
-                self.market_1,
-                self.base_side,
-                self.base_size,
-                self.base_price,
-                False,
-                time_in_force_type=Order.TimeInForce.TIME_IN_FORCE_IOC,
-            )
-
-            m2_task = place_market_order(
-                self.node,
-                self.indexer,
-                wallet,
-                self.market_2,
-                self.quote_side,
-                self.quote_size,
-                self.quote_price,
-                False,
-                time_in_force_type=Order.TimeInForce.TIME_IN_FORCE_IOC,
-            )
-
-            order_m1, order_m2 = await asyncio.gather(m1_task, m2_task)
+            order_m1 = await _commit_leg(self.market_1, self.base_side, self.base_size, self.base_price)
+            order_m2 = await _commit_leg(self.market_2, self.quote_side, self.quote_size, self.quote_price)
 
             cid_m1 = (order_m1 or {}).get("order", {}).get("id")
             cid_m2 = (order_m2 or {}).get("order", {}).get("id")
@@ -617,13 +627,21 @@ class BotAgent:
         real_filled_m1 = _sf(audit_m1.get("filled_size", 0))
         real_filled_m2 = _sf(audit_m2.get("filled_size", 0))
 
-        filled_usd_1 = real_filled_m1 * float(self.base_price)
-        filled_usd_2 = real_filled_m2 * float(self.quote_price)
+        # E3 fix: usar el PRECIO REAL PROMEDIO de fill (con slippage incluido),
+        # no el oráculo del escaneo. Fallback al ref sólo si el indexer no lo da.
+        avg_price_1 = _sf(audit_m1.get("avg_price"), 0.0) or float(self.base_price)
+        avg_price_2 = _sf(audit_m2.get("avg_price"), 0.0) or float(self.quote_price)
+
+        filled_usd_1 = real_filled_m1 * avg_price_1
+        filled_usd_2 = real_filled_m2 * avg_price_2
 
         self.order_dict["filled_size_1"] = real_filled_m1
         self.order_dict["filled_size_2"] = real_filled_m2
         self.order_dict["filled_usd_1"] = filled_usd_1
         self.order_dict["filled_usd_2"] = filled_usd_2
+        # Precio de entrada REAL (para el PnL de salida, no el oráculo).
+        self.order_dict["avg_entry_price_1"] = avg_price_1
+        self.order_dict["avg_entry_price_2"] = avg_price_2
         self.order_dict["fee_1"] = _sf(audit_m1.get("fee_total", 0))
         self.order_dict["fee_2"] = _sf(audit_m2.get("fee_total", 0))
         self.order_dict["fee_1_estimated"] = bool(audit_m1.get("fee_estimated", False))
@@ -739,6 +757,7 @@ class BotAgent:
                     self.quote_price,
                     True,
                     time_in_force_type=Order.TimeInForce.TIME_IN_FORCE_IOC,
+                    max_slippage_bps=MARKET_MAX_SLIPPAGE_BPS_FLATTEN,
                 )
                 self.order_dict["pair_status"] = "FAILED"
                 self.order_dict["comments"] = f"M1 filled 0; flattened M2 (filled={real_filled_m2})."
@@ -761,6 +780,7 @@ class BotAgent:
                     self.base_price,
                     True,
                     time_in_force_type=Order.TimeInForce.TIME_IN_FORCE_IOC,
+                    max_slippage_bps=MARKET_MAX_SLIPPAGE_BPS_FLATTEN,
                 )
                 self.order_dict["pair_status"] = "FAILED"
                 self.order_dict["comments"] = f"M2 filled 0; flattened M1 (filled={real_filled_m1})."
@@ -790,29 +810,31 @@ class BotAgent:
                 close_side_m1 = "SELL" if self.base_side.upper() == "BUY" else "BUY"
                 close_side_m2 = "SELL" if self.quote_side.upper() == "BUY" else "BUY"
 
-                await asyncio.gather(
-                    place_market_order(
-                        self.node,
-                        self.indexer,
-                        wallet,
-                        self.market_1,
-                        close_side_m1,
-                        real_filled_m1,
-                        self.base_price,
-                        True,
-                        time_in_force_type=Order.TimeInForce.TIME_IN_FORCE_IOC,
-                    ),
-                    place_market_order(
-                        self.node,
-                        self.indexer,
-                        wallet,
-                        self.market_2,
-                        close_side_m2,
-                        real_filled_m2,
-                        self.quote_price,
-                        True,
-                        time_in_force_type=Order.TimeInForce.TIME_IN_FORCE_IOC,
-                    ),
+                # E1 fix: flatten SERIALIZADO (no gather) para evitar colisión
+                # de sequence al cerrar ambas piernas.
+                await place_market_order(
+                    self.node,
+                    self.indexer,
+                    wallet,
+                    self.market_1,
+                    close_side_m1,
+                    real_filled_m1,
+                    self.base_price,
+                    True,
+                    time_in_force_type=Order.TimeInForce.TIME_IN_FORCE_IOC,
+                    max_slippage_bps=MARKET_MAX_SLIPPAGE_BPS_FLATTEN,
+                )
+                await place_market_order(
+                    self.node,
+                    self.indexer,
+                    wallet,
+                    self.market_2,
+                    close_side_m2,
+                    real_filled_m2,
+                    self.quote_price,
+                    True,
+                    time_in_force_type=Order.TimeInForce.TIME_IN_FORCE_IOC,
+                    max_slippage_bps=MARKET_MAX_SLIPPAGE_BPS_FLATTEN,
                 )
 
                 self.order_dict["pair_status"] = "FAILED"
@@ -897,6 +919,7 @@ class BotAgent:
                         self.base_price,
                         True,
                         time_in_force_type=Order.TimeInForce.TIME_IN_FORCE_IOC,
+                        max_slippage_bps=MARKET_MAX_SLIPPAGE_BPS_FLATTEN,
                     )
                 else:
                     # sobra usd en leg2
@@ -912,6 +935,7 @@ class BotAgent:
                         self.quote_price,
                         True,
                         time_in_force_type=Order.TimeInForce.TIME_IN_FORCE_IOC,
+                        max_slippage_bps=MARKET_MAX_SLIPPAGE_BPS_FLATTEN,
                     )
 
                 # 2026-07-01 FIX: después de flatten, el par está BALANCEADO

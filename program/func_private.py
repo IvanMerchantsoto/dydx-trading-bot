@@ -9,7 +9,14 @@ from dydx_v4_client.node.market import Market
 from dydx_v4_client.wallet import Wallet
 from v4_proto.dydxprotocol.clob.order_pb2 import Order
 
-from constants import API_KEY, WALLET_ADDRESS
+from constants import (
+    API_KEY,
+    WALLET_ADDRESS,
+    MARKET_MAX_SLIPPAGE_BPS_DEFAULT,
+    MARKET_MAX_SLIPPAGE_BPS_EXIT,
+    MARKET_MAX_SLIPPAGE_BPS_FLATTEN,
+    MARKET_SLIPPAGE_ORACLE_CAP_BPS,
+)
 from func_logging import log_event
 
 
@@ -82,6 +89,63 @@ async def _get_market_obj_and_oracle(indexer, market: str):
     oracle_price = _sf(market_data.get("oraclePrice"))
     market_obj = Market(market_data)
     return market_obj, oracle_price, market_data
+
+
+async def _resync_sequence(node, wallet):
+    """
+    E1 fix: re-sincroniza wallet.sequence con el estado committed de la cadena.
+    Se llama SÓLO ante rechazo/excepción de un broadcast (self-heal). En el
+    camino feliz el sequence lo incrementamos localmente tras cada OK.
+    Con el SequenceManager del SDK desactivado (LOCAL_SEQUENCE_MANAGEMENT),
+    esta es la única fuente de re-sincronización.
+    """
+    if wallet is None or node is None:
+        return
+    try:
+        acct = await node.get_account(wallet.address)
+        old = getattr(wallet, "sequence", None)
+        wallet.sequence = acct.sequence
+        log_event({
+            "type": "sequence_resync",
+            "old_sequence": old,
+            "new_sequence": acct.sequence,
+        }, print_terminal=False)
+    except Exception as e:
+        log_event({"type": "sequence_resync_error", "error": str(e)}, print_terminal=False)
+
+
+def _bounded_taker_price(side: str, oracle_price: float, best_bid, best_ask,
+                         max_slippage_bps) -> tuple:
+    """
+    E2 fix: precio límite para una orden MARKET/taker IOC, acotado.
+
+    Reemplaza la vieja banda fija oracle±5% (=500bps). El límite = mejor precio
+    del book (touch) + tolerancia, PERO nunca más lejos del oráculo que el tope
+    duro MARKET_SLIPPAGE_ORACLE_CAP_BPS. Si el book está tan torcido que el
+    touch queda fuera del tope, el límite queda del lado seguro y la IOC no
+    llena (NOT_FOUND) — comportamiento deseado: no operar books rotos.
+
+    Returns (execution_price, ref_source) donde ref_source ∈ {"book","oracle"}.
+    """
+    slip = (float(max_slippage_bps) if max_slippage_bps is not None
+            else float(MARKET_MAX_SLIPPAGE_BPS_DEFAULT))
+    tol = slip / 10_000.0
+    cap = float(MARKET_SLIPPAGE_ORACLE_CAP_BPS) / 10_000.0
+    is_buy = str(side).upper() == "BUY"
+
+    if is_buy:
+        ref = best_ask if (best_ask and best_ask > 0) else oracle_price
+        src = "book" if (best_ask and best_ask > 0) else "oracle"
+        px = ref * (1.0 + tol)
+        if oracle_price and oracle_price > 0:
+            px = min(px, oracle_price * (1.0 + cap))
+    else:
+        ref = best_bid if (best_bid and best_bid > 0) else oracle_price
+        src = "book" if (best_bid and best_bid > 0) else "oracle"
+        px = ref * (1.0 - tol)
+        if oracle_price and oracle_price > 0:
+            px = max(px, oracle_price * (1.0 - cap))
+    return float(px), src
 
 
 # ---------------------------------------------------------------------------
@@ -196,19 +260,21 @@ async def place_market_order(
     market,
     side,
     size,
-    price,  # kept for backwards compatibility
+    price,  # kept for backwards compatibility (NO longer used as the band)
     reduce_only,
     time_in_force_type,
+    max_slippage_bps=None,
 ):
     try:
         wallet = await _ensure_wallet(node, wallet)
         market_obj, oracle_price, _mdata = await _get_market_obj_and_oracle(indexer, market)
         dydx_side = _to_dydx_side(side)
 
-        if str(side).upper() == "BUY":
-            execution_price = float(oracle_price * 1.05)
-        else:
-            execution_price = float(oracle_price * 0.95)
+        # E2 fix: precio límite acotado desde el book, no banda fija ±5%.
+        best_bid, best_ask = await get_orderbook_best(indexer, market)
+        execution_price, _px_src = _bounded_taker_price(
+            side, oracle_price, best_bid, best_ask, max_slippage_bps
+        )
 
         client_id = random.randint(0, MAX_CLIENT_ID)
         order_id = market_obj.order_id(
@@ -235,13 +301,20 @@ async def place_market_order(
             good_til_block=current_block + 40,
         )
 
+        _slip_used = (float(max_slippage_bps) if max_slippage_bps is not None
+                      else float(MARKET_MAX_SLIPPAGE_BPS_DEFAULT))
         log_event({
             "type": "tx_market",
             "side": str(side).upper(),
             "market": market,
             "size": float(size),
             "oracle": oracle_price,
+            "best_bid": best_bid,
+            "best_ask": best_ask,
             "exec_price": execution_price,
+            "px_source": _px_src,
+            "max_slippage_bps": _slip_used,
+            "seq": getattr(wallet, "sequence", None),
             "reduce_only": bool(reduce_only),
         }, print_terminal=False)
 
@@ -262,7 +335,9 @@ async def place_market_order(
         }, print_terminal=False)
 
         if not broadcast_ok:
-            # Chain rechazó la tx. NO incrementar sequence — la tx no consumió nonce.
+            # Chain rechazó la tx. NO incrementar sequence — la tx no consumió
+            # nonce. Re-sincronizamos desde la cadena por si el desajuste fue de
+            # sequence (self-heal E1).
             print(f"[MARKET] ⚠️ Chain rechazó {market} cid={client_id} "
                   f"code={tx_code} log={str(raw_log)[:120]}", flush=True)
             log_event({
@@ -273,6 +348,7 @@ async def place_market_order(
                 "tx_code": tx_code,
                 "raw_log": (str(raw_log)[:500] if raw_log else None),
             })
+            await _resync_sequence(node, wallet)
             return {
                 "order": {"id": str(client_id), "status": "REJECTED", "market": market},
                 "tx_hash": str(tx_hash) if tx_hash else "unknown",
@@ -280,6 +356,7 @@ async def place_market_order(
                 "rejected": True,
             }
 
+        # Broadcast aceptado: consumimos el nonce localmente (E1).
         wallet.sequence += 1
 
         return {
@@ -300,6 +377,8 @@ async def place_market_order(
             "reduce_only": bool(reduce_only),
             "error": str(e),
         })
+        # Estado del sequence incierto tras la excepción → re-sincronizar.
+        await _resync_sequence(node, wallet)
         return None
 
 
@@ -384,6 +463,7 @@ async def place_limit_order(
                 "tx_code": tx_code,
                 "raw_log": (str(raw_log)[:500] if raw_log else None),
             })
+            await _resync_sequence(node, wallet)
             return {
                 "order": {"id": str(client_id), "status": "REJECTED", "market": market},
                 "tx_hash": str(tx_hash) if tx_hash else "unknown",
@@ -411,6 +491,7 @@ async def place_limit_order(
             "post_only": bool(post_only),
             "error": str(e),
         })
+        await _resync_sequence(node, wallet)
         return None
 
 
@@ -684,6 +765,7 @@ async def abort_all_positions(node, indexer, max_rounds=3, ignore_markets=None):
                     price=price,
                     reduce_only=True,
                     time_in_force_type=Order.TimeInForce.TIME_IN_FORCE_IOC,
+                    max_slippage_bps=MARKET_MAX_SLIPPAGE_BPS_FLATTEN,
                 )
                 print(f"[ABORT] Sent close {market} size={qty} side={side} price≤{price:.4f}")
             except Exception as e:
@@ -943,6 +1025,7 @@ async def close_pair_maker_with_fallback(
                 mkt, side, float(size), oracle,
                 True,
                 time_in_force_type=_Order.TimeInForce.TIME_IN_FORCE_IOC,
+                max_slippage_bps=MARKET_MAX_SLIPPAGE_BPS_EXIT,
             )
             results[mkt] = {"close_type": "taker_fallback", "filled": True, "fee_est": 0.0}
         except Exception as me:

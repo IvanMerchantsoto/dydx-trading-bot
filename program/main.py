@@ -12,7 +12,8 @@ from func_kpis import send_account_kpis, send_positions_status
 from func_risk_off import risk_off_close_worst_pair
 from func_messaging import send_message
 from func_logging import log_event
-from func_position_guard import assert_safe_to_open, close_markets_actual
+from func_position_guard import assert_safe_to_open, close_markets_actual, get_live_positions
+from func_kill_switch import evaluate as kill_switch_evaluate, is_halted as kill_switch_halted
 
 from constants import (
     ABORT_ALL_POSITIONS,
@@ -104,6 +105,45 @@ def _compute_dynamic_sizing(equity: float) -> tuple:
     max_open = max(1, min(int(MAX_OPEN_TRADES), dynamic_max))
 
     return usd_per_trade, max_open
+
+
+async def _kill_switch_close_all(node, indexer, wallet, reason: str):
+    """
+    Cierre de emergencia del kill-switch: cierra TODAS las posiciones live
+    (reduce_only, slippage de flatten para asegurar fill) y vacía
+    bot_agents.json. Reutiliza close_markets_actual (que ya usa el slippage
+    de flatten acotado tras la corrección E2).
+    """
+    try:
+        live = await get_live_positions(indexer, min_usd=0.0)
+        markets_to_close = list(live.keys())
+        log_event({
+            "type": "kill_switch_close_all_start",
+            "reason": reason,
+            "markets": markets_to_close,
+        })
+        if markets_to_close:
+            await close_markets_actual(
+                node, indexer, wallet, markets_to_close,
+                reason=f"kill_switch:{reason}",
+            )
+        # Vaciar el tracking local (las posiciones ya no deben gestionarse).
+        try:
+            import json as _json
+            _jp = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_agents.json")
+            with open(_jp, "w") as _f:
+                _json.dump([], _f, indent=2)
+        except Exception as _je:
+            log_event({"type": "kill_switch_json_clear_error", "error": str(_je)}, print_terminal=False)
+        send_message(
+            f"🛑🛑 KILL-SWITCH DISPARADO\n{reason}\n"
+            f"Cerradas {len(markets_to_close)} posiciones. Entradas BLOQUEADAS "
+            f"hasta reset manual (func_kill_switch.reset_kill_switch)."
+        )
+        log_event({"type": "kill_switch_close_all_done", "closed_markets": markets_to_close})
+    except Exception as e:
+        log_event({"type": "kill_switch_close_all_error", "error": str(e)})
+        send_message(f"⚠️ Kill-switch: error cerrando posiciones: {e}")
 
 
 async def main():
@@ -233,6 +273,20 @@ async def main():
 
                 if snapshot:
                     current_equity = snapshot.get("equity", 0.0)
+
+                    # ── Kill-switch de pérdida absoluta (persistente) ──────
+                    # Se evalúa contra el high-water histórico en disco, NO
+                    # contra el equity del arranque → sobrevive a reinicios.
+                    try:
+                        _ks_halted, _ks_info = kill_switch_evaluate(current_equity)
+                        if _ks_halted and _ks_info.get("triggered"):
+                            # Transición a halted en este ciclo → cerrar todo.
+                            await _kill_switch_close_all(
+                                node, indexer, wallet,
+                                reason=_ks_info.get("reason", "kill_switch"),
+                            )
+                    except Exception as _kse:
+                        log_event({"type": "kill_switch_eval_error", "error": str(_kse)}, print_terminal=False)
 
                     # Seed session-start equity on first successful read
                     if equity_session_start is None and current_equity > 0:
@@ -478,8 +532,13 @@ async def main():
                 print(f"[D5] open_pairs={open_pairs} (json={json_pairs} real={real_open_pairs_estimate} orphans={json_orphans}) "
                       f"max={eff_max_open} usd={eff_usd_per_trade:.0f} batch={opened_since_exit}/{BATCH_OPEN_TRADES}", flush=True)
 
+                # ── Kill-switch halt (persistente entre reinicios) ─────────
+                if kill_switch_halted():
+                    print("[D5] KILL-SWITCH activo — entradas BLOQUEADAS (reset manual requerido).", flush=True)
+                    log_event({"type": "kill_switch_entry_block"}, print_terminal=False)
+
                 # ── Drawdown halt check ────────────────────────────────────
-                if DRAWDOWN_CIRCUIT_BREAKER_ENABLED and drawdown_halt_until > now:
+                elif DRAWDOWN_CIRCUIT_BREAKER_ENABLED and drawdown_halt_until > now:
                     remaining_h = (drawdown_halt_until - now) / 3600.0
                     print(f"[D5] Drawdown circuit breaker — {remaining_h:.2f}h remaining. "
                           f"Skipping new entries.", flush=True)

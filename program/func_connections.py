@@ -12,6 +12,7 @@ NODE,
 INDEXER,
 WEBSOCKET,
 MODE,
+LOCAL_SEQUENCE_MANAGEMENT,
 )
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -58,6 +59,20 @@ async def connect_dydx():
             indexer = IndexerClient(CUSTOM_NETWORK.rest_indexer)
 
             wallet = await Wallet.from_mnemonic(node, API_KEY, WALLET_ADDRESS)
+
+            # ── E1 fix: gestión LOCAL del sequence ───────────────────────────
+            # Desactivamos el SequenceManager del SDK. Con él activo, cada envío
+            # re-consulta el sequence *committed* de la cadena; dos órdenes en el
+            # mismo bloque leen el mismo valor → colisión → legging. Sin él,
+            # firmamos con wallet.sequence (fresco de from_mnemonic), lo
+            # incrementamos localmente tras cada broadcast OK y re-sincronizamos
+            # sólo ante error (ver func_private._resync_sequence).
+            if LOCAL_SEQUENCE_MANAGEMENT:
+                try:
+                    node.sequence_manager = None
+                    print(f"[CONN] Local sequence management ON (seq={wallet.sequence}).", flush=True)
+                except Exception as _se:
+                    print(f"[CONN] No se pudo desactivar sequence_manager: {_se}", flush=True)
 
             # Verificación rápida de que la cuenta existe
             response = await indexer.account.get_subaccounts(WALLET_ADDRESS)

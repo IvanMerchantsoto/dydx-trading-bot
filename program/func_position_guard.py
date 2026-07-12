@@ -3,7 +3,7 @@ import os
 import asyncio
 from datetime import datetime, timezone
 
-from constants import WALLET_ADDRESS, MAX_OPEN_TRADES, UNMANAGED_IGNORE_MARKETS
+from constants import WALLET_ADDRESS, MAX_OPEN_TRADES, UNMANAGED_IGNORE_MARKETS, MARKET_MAX_SLIPPAGE_BPS_FLATTEN
 from func_logging import log_event
 from func_messaging import send_message
 from func_private import place_market_order, get_real_fill_details
@@ -254,6 +254,7 @@ async def close_market_actual(node, indexer, wallet, market, reason="cleanup"):
         price=px,
         reduce_only=True,
         time_in_force_type=Order.TimeInForce.TIME_IN_FORCE_IOC,
+        max_slippage_bps=MARKET_MAX_SLIPPAGE_BPS_FLATTEN,
     )
     cid = (res or {}).get("order", {}).get("id")
     audit = None

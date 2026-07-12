@@ -7,6 +7,7 @@
 # Estado del bot — específico por máquina/sesión
 program/bot_agents.json
 program/pair_fail_cooldowns.json
+program/risk_state.json
 program/bot_run.log.jsonl
 program/bot_out.log
 bot_stdout.log

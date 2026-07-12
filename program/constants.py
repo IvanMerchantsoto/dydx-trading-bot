@@ -467,3 +467,56 @@ UNMANAGED_IGNORE_MARKETS = set()
 # todos posiciones atascadas en testnet sin liquidez. En mainnet no aplica.
 # Si en mainnet aparece exposición que el bot no puede cerrar (raro), agregar
 # manualmente aquí.
+
+# ============================================================================
+# ===== Execution Safety (2026-07-11 — auditoría adversarial fase 1) =====
+# ============================================================================
+# Correcciones de los riesgos críticos E1 (legging por colisión de sequence),
+# E2 (slippage IOC ±5% no controlado) y E4 (cierre no atómico).
+
+# --- E1: gestión LOCAL del sequence de Cosmos ---
+# El SequenceManager del SDK re-consulta el sequence de la cadena (estado
+# *committed*) antes de CADA envío. Como el bloque tarda ~1-1.5s, dos órdenes
+# enviadas dentro del mismo bloque leen el MISMO sequence → una la rechaza la
+# cadena (account sequence mismatch) → sólo se ejecuta una pierna (legging).
+# Con gestión local incrementamos el sequence nosotros y sólo re-sincronizamos
+# ante error. Combinado con envío SERIALIZADO de las dos piernas, elimina la
+# colisión. Poner en False revierte al comportamiento del SDK (diagnóstico).
+LOCAL_SEQUENCE_MANAGEMENT = True
+
+# --- E2: slippage máximo tolerado al cruzar el book (bps sobre el touch) ---
+# Reemplaza la banda fija oracle±5% (=500bps) de place_market_order que causaba
+# el "slippage bleed". El precio límite de la IOC se deriva del mejor bid/ask
+# real + esta tolerancia, y NUNCA se aleja del oráculo más de ORACLE_CAP_BPS.
+#   ENTRY:   tight — si no llena dentro de esto, es un par ilíquido que NO
+#            conviene operar (el NOT_FOUND resultante evita el mal trade).
+#   EXIT:    salidas por SL/HARD_SL/TP-market — prioriza el fill pero acotado.
+#   FLATTEN: limpieza de piernas huérfanas / cierre forzoso — debe llenar.
+MARKET_MAX_SLIPPAGE_BPS_ENTRY   = 40
+MARKET_MAX_SLIPPAGE_BPS_EXIT    = 200
+MARKET_MAX_SLIPPAGE_BPS_FLATTEN = 400
+MARKET_MAX_SLIPPAGE_BPS_DEFAULT = 80
+# Tope duro vs oráculo: aunque touch+tolerancia lo permita, jamás pagar más
+# lejos del oráculo que esto (defensa contra books rotos / oráculo torcido).
+MARKET_SLIPPAGE_ORACLE_CAP_BPS  = 500
+
+# ============================================================================
+# ===== Kill-switch de pérdida absoluta (persistente entre reinicios) =====
+# ============================================================================
+# R2/R4: el drawdown circuit breaker sólo frena ENTRADAS y su baseline se
+# resiembra en cada arranque, así que un crash-loop lo derrota. El kill-switch
+# mantiene un "high-water equity" PERSISTIDO en disco (risk_state.json) que
+# sobrevive a los reinicios; cuando el equity cae por debajo del máximo
+# histórico más de KILL_SWITCH_MAX_DRAWDOWN_(USD|PCT), CIERRA todas las
+# posiciones y bloquea nuevas entradas hasta reset manual.
+KILL_SWITCH_ENABLED = True
+KILL_SWITCH_MAX_DRAWDOWN_USD = 40.0     # pérdida absoluta desde el high-water
+KILL_SWITCH_MAX_DRAWDOWN_PCT = 0.08     # o % del high-water (lo que ocurra antes)
+# Slippage para el cierre de emergencia del kill-switch (debe llenar).
+KILL_SWITCH_CLOSE_SLIPPAGE_BPS = 400
+
+# ===== Concentración (R3) =====
+# 2026-07-11: 2 → 1. Permitir el mismo mercado en 2 pares introduce correlación
+# (un movimiento adverso pega en ambos a la vez). Hasta demostrar rentabilidad
+# neta out-of-sample, un mercado sólo puede estar en 1 par abierto.
+MAX_TRADES_PER_MARKET = 1

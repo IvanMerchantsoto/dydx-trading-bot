@@ -2,9 +2,11 @@ from decouple import config
 
 # ===== Loop / Cadencia =====
 EXIT_CHECK_SECONDS = 30       # cada cuánto evalúas exits (segundos)
-KPI_SECONDS = 3600            # 2026-07-10: 10min → 1h (menos spam Telegram)
-SESSION_SUMMARY_SECONDS = 1800  # 2026-07-10: 5min → 30min
-POSITIONS_STATUS_SECONDS = 900 # 2026-07-10 NUEVO: status por par cada 15min
+KPI_SECONDS = 3600            # 2026-07-10: 10min → 1h (solo log, sin Telegram)
+SESSION_SUMMARY_SECONDS = 1800  # 2026-07-10: 5min → 30min (solo log, sin Telegram)
+POSITIONS_STATUS_SECONDS = 600 # 2026-07-12: 15min → 10min. UNIFICADO — este es
+                               # el único mensaje periódico de Telegram con:
+                               # pares abiertos, entry_z, z_now, best_z, unreal.
 BATCH_OPEN_TRADES = 3         # abrir N trades y luego forzar revisión
 MAX_OPEN_TRADES = 10          # 2026-07-10: 5 → 10. Cap absoluto de seguridad.
                               # Estrategia diversificación: 5 pares × $65/leg =

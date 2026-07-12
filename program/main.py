@@ -226,7 +226,9 @@ async def main():
         print(f"[D4] KPI check (elapsed={(now-last_kpi_ts):.0f}s / {KPI_SECONDS}s)", flush=True)
         if now - last_kpi_ts >= KPI_SECONDS:
             try:
-                snapshot = await send_account_kpis(indexer)
+                # 2026-07-12: send_telegram=False. Solo log JSON, sin spam Telegram.
+                # El único mensaje periódico de Telegram es positions_status (cada 10min).
+                snapshot = await send_account_kpis(indexer, send_telegram=False)
                 last_kpi_ts = now
 
                 if snapshot:
@@ -330,7 +332,8 @@ async def main():
                             f"Cierres: TP={session_stats.get('tp_count',0)} | loss={session_stats.get('loss_exit_count',0)} | SL={sl_count} | orphan={session_stats.get('orphan_cleanup_count',0)}",
                             f"PnL est cierres: ${session_stats.get('net_pnl_est_sum', 0.0):+.2f}",
                         ]
-                        send_message("\n".join(msg_parts))
+                        # 2026-07-12: NO send_message. Session summary solo va al log.
+                        # Único mensaje periódico Telegram es positions_status (10min).
                         log_event({
                             "type": "session_summary",
                             "age_h": round(session_age_h, 3),

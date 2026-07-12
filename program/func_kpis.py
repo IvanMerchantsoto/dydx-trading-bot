@@ -247,11 +247,7 @@ async def send_positions_status(indexer) -> None:
             pairs = json.load(f) or []
         pairs = [p for p in pairs if isinstance(p, dict)]
 
-        if not pairs:
-            # No mandar mensaje si no hay pares abiertos (evita spam)
-            return
-
-        # Fetch positions del indexer
+        # Fetch positions del indexer siempre (para mensaje sea pares o no)
         try:
             resp = await indexer.account.get_subaccount(WALLET_ADDRESS.strip(), 0)
             sub = resp.get("subaccount", {}) or {}
@@ -261,6 +257,19 @@ async def send_positions_status(indexer) -> None:
         except Exception:
             live_positions = {}
             equity = free = 0.0
+
+        # 2026-07-12: si no hay pares, mensaje mínimo con equity (heartbeat)
+        if not pairs:
+            send_message(
+                f"📊 *Heartbeat* — 0 pares abiertos\n"
+                f"💰 Equity: ${equity:.2f}  Free: ${free:.2f}"
+            )
+            log_event({
+                "type": "positions_status_sent",
+                "n_pairs": 0,
+                "equity": equity,
+            }, print_terminal=False)
+            return
 
         now = datetime.now(timezone.utc)
         lines = ["📍 *Estado de pares abiertos*", ""]

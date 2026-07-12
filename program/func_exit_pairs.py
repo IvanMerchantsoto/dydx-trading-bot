@@ -666,31 +666,62 @@ async def manage_trade_exits(node, indexer, wallet):
                             f"| min_gross={min_gross_required:.2f}"
                         )
                     elif pnl_gross < 0.0:
-                        # ── DISABLED 2026-05-21 (Bug #1 fix) ──────────────────
-                        # Antiguo TP_LOSS_EXIT: cerraba pagando fees cuando z revirtió
-                        # pero gross_pnl<0. Análisis del log 2026-05-20/22 mostró que
-                        # 9 de 14 cierres siguieron esta rama y todos terminaron con
-                        # net_pnl_est entre -$1 y -$2 (fees comieron el casi-empate).
+                        # ── 2026-07-11 RE-ENABLED TP_MEAN_REVERTED (con gate estricto) ──
+                        # Contexto: bot en Jun 30 no cerraba con pnl_gross<0. Observado
+                        # tp_confirm=916 (8+ horas intentando cerrar) mientras spread
+                        # revertía perfecto (best_z=0.02) pero pnl estaba en -$0.88.
+                        # Sin acción, se queda hasta HARD_SL a -$2.60.
                         #
-                        # Nueva regla: si z revirtió y estamos en pérdida bruta,
-                        # NO cerrar por TP. Mantener la posición y dejar que
-                        # gobiernen HARD_SL (pérdida monetaria absoluta) o Z_SL
-                        # (z se aleja más en contra). Si el spread vuelve a moverse
-                        # a favor, podremos cerrar como TP real cuando ok_profit pase.
-                        tp_blocked_profit_count += 1
-                        log_event({
-                            "type": "tp_blocked_loss",
-                            "trace_id": trace_id,
-                            "m1": m1, "m2": m2,
-                            "pnl_gross": pnl_gross,
-                            "net_est": net_pnl_est,
-                            "open_fees": open_fees_paid,
-                            "close_fees_est": close_fees_est,
-                            "z_now": z_now,
-                            "z_entry": z_entry,
-                            "age_hours": age_hours,
-                            "policy": "hold_until_hard_sl_or_zsl",
-                        }, print_terminal=False)
+                        # Nueva regla estricta: si best_z <= Z_TP (spread realmente
+                        # revirtió) Y pérdida entre -$0.50 y 0 (fees + slippage),
+                        # aceptar el close en -$0.50. Peor caso -$0.50 << HARD_SL -$2.60.
+                        #
+                        # DIFERENCIAS con la versión Jul 3 (que reveramos):
+                        #  - MAX_LOSS $0.50 (era $1.60)  ← 3x más estricto
+                        #  - Requiere best_z REALMENTE cerca de 0 (0.5 clamp)
+                        #  - Requiere age >= 60min (evita whipsaw temprano)
+                        TP_MEAN_REVERTED_MAX_LOSS = -0.50
+                        MIN_AGE_FOR_MEAN_REV_LOSS_MIN = 60.0
+                        BEST_Z_MEAN_REV_MAX = 0.5
+                        best_z_val = _sf(position.get("best_z", abs(z_now) + 99.0))
+                        age_ok = (age_min is not None and age_min >= MIN_AGE_FOR_MEAN_REV_LOSS_MIN)
+                        loss_ok = (pnl_gross >= TP_MEAN_REVERTED_MAX_LOSS)
+                        reverted_ok = (best_z_val <= BEST_Z_MEAN_REV_MAX)
+
+                        if age_ok and loss_ok and reverted_ok:
+                            is_close = True
+                            close_reason = (
+                                f"TP_MEAN_REVERTED: best_z={best_z_val:.3f} "
+                                f"(spread reverted), z_now={z_now:.3f}, "
+                                f"age={age_min:.0f}min, pnl_gross={pnl_gross:.3f} "
+                                f"(accepting small loss to avoid HARD_SL degradation)"
+                            )
+                            log_event({
+                                "type": "tp_mean_reverted",
+                                "trace_id": trace_id,
+                                "m1": m1, "m2": m2,
+                                "pnl_gross": round(pnl_gross, 4),
+                                "best_z": round(best_z_val, 4),
+                                "z_now": round(z_now, 4),
+                                "age_min": round(age_min, 1) if age_min else None,
+                            })
+                        else:
+                            tp_blocked_profit_count += 1
+                            log_event({
+                                "type": "tp_blocked_loss",
+                                "trace_id": trace_id,
+                                "m1": m1, "m2": m2,
+                                "pnl_gross": pnl_gross,
+                                "net_est": net_pnl_est,
+                                "z_now": z_now,
+                                "z_entry": z_entry,
+                                "best_z": best_z_val,
+                                "gate_failed": (
+                                    "age" if not age_ok else
+                                    ("loss_too_big" if not loss_ok else
+                                     ("best_z_not_reverted" if not reverted_ok else "unknown"))
+                                ),
+                            }, print_terminal=False)
                     else:
                         # pnl_gross > 0 but not enough to cover fees + min net profit yet.
                         # Keep waiting — the spread might improve further.

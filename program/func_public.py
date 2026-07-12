@@ -24,7 +24,10 @@ ISO_TIMES = get_ISO_times()
 #
 # Memory: 119 markets × 100 floats × 8 bytes = ~95 KB. Trivial.
 _CANDLE_CACHE = {}  # market_name → (numpy_array, fetch_timestamp_s)
-_CANDLE_CACHE_TTL_S = 30 * 60   # 30 minutes
+_CANDLE_CACHE_TTL_S = 60        # 2026-07-11: 30min → 60s. Cache 30min hacía
+                                # que z_now fuera IDÉNTICO por 30 min y el bot
+                                # tomara decisiones con data vieja.
+                                # 60s aún reduce API calls pero z_now se actualiza.
 
 # 2026-07-01: track markets that hit persistent errors so we don't spam logs
 _CANDLE_ERROR_LOGGED: set = set()

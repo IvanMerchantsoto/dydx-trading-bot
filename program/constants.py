@@ -455,6 +455,12 @@ HURST_MIN_BARS = 40          # mínimo de barras para calcular Hurst confiableme
 # Vaciar solo si cointegración se rehace y el mercado muestra PF>1.0.
 MARKET_BLACKLIST = {
     "PENDLE-USD",   # tóxico: 5 pares en bottom-10, -$1,148 combinado (backtest 2026-05)
+    # 2026-07-12: pares con spread crónico > 300bps (slippage brutal en close)
+    "CRO-USD",      # 992bps observado 05:01 → slippage -$5+ en close FIL/CRO
+    "ZORA-USD",     # 1200bps observado repetidamente
+    "AXL-USD",      # 1800bps observado
+    "HBAR-USD",     # 383bps crónico
+    # Si aparece nuevo par con SPREAD_CEILING repetido, agregar aquí.
 }
 
 UNMANAGED_IGNORE_MARKETS = set()

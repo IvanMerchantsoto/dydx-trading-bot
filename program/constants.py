@@ -8,7 +8,11 @@ POSITIONS_STATUS_SECONDS = 600 # 2026-07-12: 15min → 10min. UNIFICADO — este
                                # el único mensaje periódico de Telegram con:
                                # pares abiertos, entry_z, z_now, best_z, unreal.
 BATCH_OPEN_TRADES = 3         # abrir N trades y luego forzar revisión
-MAX_OPEN_TRADES = 10          # 2026-07-10: 5 → 10. Cap absoluto de seguridad.
+MAX_OPEN_TRADES = 2           # 2026-07-12: 10 → 2 para el piloto controlado
+                              # (auditoría). Máx 2 pares simultáneos hasta validar
+                              # rentabilidad neta real con reconcile_pnl.py.
+# NOTA histórica del valor anterior (10):
+# 2026-07-10: 5 → 10. Cap absoluto de seguridad.
                               # Estrategia diversificación: 5 pares × $65/leg =
                               # $650 notional (~igual al de 3×$100), pero:
                               #   - Variance portfolio: 33% → 20%
@@ -522,7 +526,9 @@ MARKET_SLIPPAGE_ORACLE_CAP_BPS  = 500
 # histórico más de KILL_SWITCH_MAX_DRAWDOWN_(USD|PCT), CIERRA todas las
 # posiciones y bloquea nuevas entradas hasta reset manual.
 KILL_SWITCH_ENABLED = True
-KILL_SWITCH_MAX_DRAWDOWN_USD = 40.0     # pérdida absoluta desde el high-water
+# 2026-07-12: 40 → 25 para el piloto controlado con equity ~$589.
+# 25 USD ≈ 4.2% del equity → corta la sangría temprano en el piloto.
+KILL_SWITCH_MAX_DRAWDOWN_USD = 25.0     # pérdida absoluta desde el high-water
 KILL_SWITCH_MAX_DRAWDOWN_PCT = 0.08     # o % del high-water (lo que ocurra antes)
 # Slippage para el cierre de emergencia del kill-switch (debe llenar).
 KILL_SWITCH_CLOSE_SLIPPAGE_BPS = 400

@@ -622,12 +622,16 @@ async def get_real_fill_details(indexer, client_id, market, max_fill_lookback=20
         raw_status = str(order.get("status") or "UNKNOWN").upper()
         original_size = _sf(order.get("size", 0))
         remaining = _sf(order.get("remainingSize", 0))
-        avg_price = _sf(
-            order.get("averageFilledPrice")
-            or order.get("avgFillPrice")
-            or order.get("price")
-            or 0.0
-        )
+
+        # ── BUGFIX 2026-07-13 (LTC/INJ) ──────────────────────────────────────
+        # avg_price debe ser el precio REAL de ejecución. NUNCA order["price"],
+        # que es el LÍMITE de la IOC (touch ± banda de slippage 40-200bps). Usar
+        # el límite falseaba el PnL ~2% del notional/pierna SIEMPRE hacia pérdida
+        # (LTC/INJ: recompute -$1.08 cuando el fill real dio +$0.30). Si no hay
+        # avg real disponible, avg_price=0.0 → el recompute E3 lo IGNORA y
+        # conserva el proxy de oráculo (menos sesgado que el precio límite).
+        avg_price = _sf(order.get("averageFilledPrice") or order.get("avgFillPrice") or 0.0)
+        limit_price_est = _sf(order.get("price"))   # sólo para estimar notional
 
         filled_size = _sf(
             order.get("totalFilled")
@@ -637,7 +641,9 @@ async def get_real_fill_details(indexer, client_id, market, max_fill_lookback=20
         )
 
         fee_total = _sf(order.get("fee") or order.get("feeAmount") or order.get("feeUsd") or 0.0)
-        filled_usd = filled_size * avg_price
+        # Para el notional (gate de min-fill, fee estimada) sí podemos usar el
+        # límite como aproximación cuando falta el avg real — no afecta al PnL.
+        filled_usd = filled_size * (avg_price if avg_price > 0 else limit_price_est)
 
         # Fallback: estimate taker fee when indexer omits fee data
         fee_estimated = False

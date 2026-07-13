@@ -834,10 +834,12 @@ async def manage_trade_exits(node, indexer, wallet):
                 _close_cid_m2 = (_close_res_m2 or {}).get("order", {}).get("id")
                 try:
                     if _close_cid_m1 and _close_cid_m2:
-                        # Indexer typically lags 1-2s on fills, sleep before polling
-                        await asyncio.sleep(1.5)
-                        _det_m1 = await get_real_fill_details(indexer, _close_cid_m1, m1, max_fill_lookback=50)
-                        _det_m2 = await get_real_fill_details(indexer, _close_cid_m2, m2, max_fill_lookback=50)
+                        # El indexer tarda en poblar averageFilledPrice; esperamos
+                        # más (3s) y ampliamos el lookback para pillar el fill REAL
+                        # y no caer al proxy de oráculo (ver bugfix avg_price).
+                        await asyncio.sleep(3.0)
+                        _det_m1 = await get_real_fill_details(indexer, _close_cid_m1, m1, max_fill_lookback=200)
+                        _det_m2 = await get_real_fill_details(indexer, _close_cid_m2, m2, max_fill_lookback=200)
                         _real_fee_close = _sf(_det_m1.get("fee_total", 0.0)) + _sf(_det_m2.get("fee_total", 0.0))
                         _close_fee_estimated = bool(_det_m1.get("fee_estimated", True)) or bool(_det_m2.get("fee_estimated", True))
 

@@ -696,7 +696,7 @@ class BotAgent:
                 })
                 try:
                     await cancel_order_by_client_id(self.node, cid)
-                    await asyncio.sleep(1.5)  # let cancel propagate
+                    await asyncio.sleep(2.0)  # let cancel propagate
                 except Exception as ce:
                     log_event({
                         "type": "best_effort_cancel_error",
@@ -706,10 +706,27 @@ class BotAgent:
                     })
 
         # After cancellation attempts, query the REAL position sizes.
-        # This overrides audit-derived fill sizes for BEST_EFFORT legs.
+        # ── BUGFIX 2026-07-13 (ALGO/RENDER) ──────────────────────────────────
+        # Una MARKET IOC que quedó transitoriamente OPEN llena on-chain pero el
+        # indexer puede tardar varios segundos en reflejarlo. La versión previa
+        # consultaba UNA vez y, si aún no era visible, declaraba FAILED dejando
+        # una posición REAL sin rastrear → orphan → el reconcile la cerraba 30s
+        # después con coste de spread ("ENTRY BLOCKED" + sangrado). Ahora
+        # hacemos POLL con reintentos para captar el fill retrasado y NO
+        # abandonar una posición viva.
         if "BEST_EFFORT_OPENED" in (status_m1, status_m2):
-            try:
-                real_pos = await get_live_positions(self.indexer, min_usd=0.5)
+            for _be_attempt in range(4):
+                await asyncio.sleep(2.0)
+                try:
+                    real_pos = await get_live_positions(self.indexer, min_usd=0.5)
+                except Exception as be:
+                    log_event({
+                        "type": "best_effort_pos_recheck_error",
+                        "trace_id": self.trace_id,
+                        "attempt": _be_attempt + 1,
+                        "error": str(be),
+                    })
+                    continue
                 if status_m1 == "BEST_EFFORT_OPENED":
                     pos_m1 = real_pos.get(self.market_1)
                     if pos_m1:
@@ -724,29 +741,70 @@ class BotAgent:
                         filled_usd_2 = real_filled_m2 * float(self.quote_price)
                         self.order_dict["filled_size_2"] = real_filled_m2
                         self.order_dict["filled_usd_2"] = filled_usd_2
-                log_event({
-                    "type": "best_effort_pos_recheck",
-                    "trace_id": self.trace_id,
-                    "m1_had_best_effort": status_m1 == "BEST_EFFORT_OPENED",
-                    "m2_had_best_effort": status_m2 == "BEST_EFFORT_OPENED",
-                    "real_filled_m1": real_filled_m1,
-                    "real_filled_m2": real_filled_m2,
-                    "filled_usd_1": filled_usd_1,
-                    "filled_usd_2": filled_usd_2,
-                })
-            except Exception as be:
-                log_event({
-                    "type": "best_effort_pos_recheck_error",
-                    "trace_id": self.trace_id,
-                    "error": str(be),
-                })
+                # Si las piernas afectadas por BEST_EFFORT ya se resolvieron, parar.
+                m1_done = (status_m1 != "BEST_EFFORT_OPENED") or real_filled_m1 > 0
+                m2_done = (status_m2 != "BEST_EFFORT_OPENED") or real_filled_m2 > 0
+                if m1_done and m2_done:
+                    break
+            log_event({
+                "type": "best_effort_pos_recheck",
+                "trace_id": self.trace_id,
+                "m1_had_best_effort": status_m1 == "BEST_EFFORT_OPENED",
+                "m2_had_best_effort": status_m2 == "BEST_EFFORT_OPENED",
+                "real_filled_m1": real_filled_m1,
+                "real_filled_m2": real_filled_m2,
+                "filled_usd_1": filled_usd_1,
+                "filled_usd_2": filled_usd_2,
+            })
 
         # =========================================================
         # PHASE 4: DECISIÓN
         # =========================================================
 
-        # Caso 1: ambas 0
+        # Caso 1: ambas 0 (según audit/recheck)
         if real_filled_m1 <= 0 and real_filled_m2 <= 0:
+            # ── BUGFIX 2026-07-13 (ALGO/RENDER) ──────────────────────────────
+            # Antes de declarar FAILED, verificación AUTORITATIVA final: una IOC
+            # pudo llenar tras el audit (lag). Si hay posición REAL en cualquier
+            # leg, la aplanamos AQUÍ (reduce-only, serializado) en vez de dejarla
+            # como orphan para que el reconcile la cierre 30-60s después (peor
+            # precio + "ENTRY BLOCKED" + ensucia stats con un falso trade).
+            try:
+                await asyncio.sleep(2.0)
+                final_pos = await get_live_positions(self.indexer, min_usd=0.5)
+                stuck = []
+                for mkt, ref_px in ((self.market_1, self.base_price), (self.market_2, self.quote_price)):
+                    p = final_pos.get(mkt)
+                    if p and abs(_sf(p.get("size", 0))) > 0:
+                        stuck.append((mkt, _sf(p.get("size", 0))))
+                if stuck:
+                    log_event({
+                        "type": "failed_entry_residual_flatten",
+                        "trace_id": self.trace_id,
+                        "stuck": [{"market": m, "size": s} for m, s in stuck],
+                    })
+                    for mkt, sz in stuck:
+                        close_side = "SELL" if sz > 0 else "BUY"
+                        await place_market_order(
+                            self.node, self.indexer, wallet,
+                            mkt, close_side, abs(sz),
+                            self.base_price if mkt == self.market_1 else self.quote_price,
+                            True,
+                            time_in_force_type=Order.TimeInForce.TIME_IN_FORCE_IOC,
+                            max_slippage_bps=MARKET_MAX_SLIPPAGE_BPS_FLATTEN,
+                        )
+                    self.order_dict["pair_status"] = "FAILED"
+                    self.order_dict["comments"] = (
+                        f"Late IOC fill tras audit; aplanado en-flujo {[m for m,_ in stuck]} "
+                        f"(m1={status_m1}, m2={status_m2})."
+                    )
+                    return self.order_dict
+            except Exception as _fe:
+                log_event({
+                    "type": "failed_entry_flatten_error",
+                    "trace_id": self.trace_id,
+                    "error": str(_fe),
+                })
             self.order_dict["pair_status"] = "FAILED"
             self.order_dict["comments"] = f"Both legs filled 0 (m1={status_m1}, m2={status_m2})."
             return self.order_dict

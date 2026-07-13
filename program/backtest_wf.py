@@ -465,16 +465,27 @@ def run_sweep(pairs, cache, unique_markets, args):
               f"{r['n']:>5} {r['wr']:>6} {r['pf']:>6} {r['ev']:>8.4f} {r['net']:>9.2f} "
               f"{r['sharpe']:>6} {r['dd']:>8}{flag}")
     winners = [r for r in rows if r["net"] > 0 and r["ev"] > 0 and r["n"] >= 20]
+    max_n = max((r["n"] for r in rows), default=0)
+    total_trades = sum(r["n"] for r in rows)
     print()
-    if winners:
+    if max_n < 20:
+        # NO es un veredicto de estrategia: no hay muestra suficiente.
+        print(f"  ⚠️  INCONCLUYENTE — muestra insuficiente (máx n por combo = {max_n}).")
+        print(f"     El walk-forward honesto casi no produce trades porque:")
+        print(f"       (a) el indexer no tiene {args.bars}h de historia para la mayoría")
+        print(f"           del universo (pocos mercados con datos), y/o")
+        print(f"       (b) la cointegración NO persiste al re-testear por fold")
+        print(f"           (los pares dejan de estar cointegrados periodo a periodo).")
+        print(f"     Esto NO dice 'la geometría no sirve' — dice 'no se puede validar")
+        print(f"     con backtest en este universo/datos'. Único juez válido: en vivo.")
+    elif winners:
         b = winners[0]
         print(f"  🎯 Mejor combo con EV>0 y n>=20: window={b['window']} z_entry={b['z_entry']} "
               f"z_tp={b['z_tp']} stop={b['stop']} → NET=${b['net']} EV=${b['ev']} WR={b['wr']}%")
         print(f"     (compáralo también a --cost-bps-per-leg 100 y 150 antes de decidir.)")
     else:
-        print(f"  🛑 NINGUNA combinación da EV>0 con n>=20 a {args.cost_bps_per_leg}bps/pierna.")
-        print(f"     A este coste la geometría no se arregla con parámetros → revisar")
-        print(f"     tesis/mercado o probar coste menor (pares más líquidos).")
+        print(f"  🛑 Con muestra suficiente, NINGUNA combinación da EV>0 a "
+              f"{args.cost_bps_per_leg}bps/pierna → geometría sin arreglo por parámetros.")
     print(f"\n  Recordatorio: gross al MID, ejecución perfecta. Es sensibilidad RELATIVA")
     print(f"  entre combos, NO prueba de GO. La verdad es reconcile_pnl.py en vivo.\n")
 

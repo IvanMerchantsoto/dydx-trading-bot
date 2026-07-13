@@ -159,6 +159,19 @@ def align_by_ts(series_1, series_2):
     return ts, p1, p2
 
 
+def _zscore(spread, window):
+    """
+    Z-score rolling con ventana PARAMETRIZABLE (para el sweep de WINDOW).
+    Idéntico en forma a func_cointegration.calculate_zscore pero con window
+    explícito: z_t = (spread_t − mean_{t-window..t}) / std_{t-window..t}.
+    Sin look-ahead (rolling causal). Devuelve np.array (NaN en el warm-up).
+    """
+    s = pd.Series(spread)
+    mean = s.rolling(window=window).mean()
+    std = s.rolling(window=window).std()
+    return ((s - mean) / std).values
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Selección de pares en la ventana de ENTRENAMIENTO (paridad con live)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -167,7 +180,7 @@ def train_select(p1_train, p2_train):
     Replica el filtro de cointegración del bot sobre la ventana de train.
     Returns (passes: bool, hedge_ratio: float, half_life: float).
     """
-    if len(p1_train) < max(40, WINDOW + 5) or len(p2_train) < max(40, WINDOW + 5):
+    if len(p1_train) < 40 or len(p2_train) < 40:
         return False, None, None
     try:
         coint_flag, hedge_ratio, half_life, r_sq, p_val = calculate_cointegration(
@@ -192,14 +205,25 @@ def train_select(p1_train, p2_train):
 # Simulación en la ventana de TEST (paridad de salida con func_exit_pairs)
 # ─────────────────────────────────────────────────────────────────────────────
 def simulate_test(p1_full, p2_full, test_start, test_end, hedge_ratio, half_life,
-                  usd, cost_bps_leg, funding_bps_day):
+                  usd, cost_bps_leg, funding_bps_day, params):
     """
-    Opera SÓLO en [test_start, test_end). El z-score usa la ventana rodante
-    WINDOW terminando en la barra actual (sólo datos pasados → sin look-ahead).
-    Costes: (fee+slippage+spread) por pierna en entrada y salida + funding.
+    Opera SÓLO en [test_start, test_end) con los parámetros dados (params), para
+    poder barrer WINDOW / z_entry / Z_TP / stop_mode. El z usa ventana rodante
+    causal (sin look-ahead). Costes: (fee+slippage+½spread)/pierna × 4 + funding.
+
+    params: window, z_entry, z_tp, z_sl_delta, tp_confirm, hard_sl_usd,
+            hard_sl_pct, stop_mode ('monetary'|'zonly'), time_stop_bars.
     """
+    window = int(params["window"])
+    z_entry_thr = float(params["z_entry"])
+    z_tp = float(params["z_tp"])
+    z_sl_delta = float(params["z_sl_delta"])
+    tp_confirm_req = int(params["tp_confirm"])
+    stop_mode = params.get("stop_mode", "monetary")
+    time_stop_bars = int(params.get("time_stop_bars", 500))
+
     spread = p1_full - hedge_ratio * p2_full
-    z_series = calculate_zscore(pd.Series(spread)).values
+    z_series = _zscore(spread, window)
 
     trades = []
     state = "flat"
@@ -210,18 +234,17 @@ def simulate_test(p1_full, p2_full, test_start, test_end, hedge_ratio, half_life
     tp_confirm = 0
     best_z = 99.0
     notional = 2.0 * usd
-    # coste por round-trip completo (2 piernas × entrada+salida)
     exec_cost = 4.0 * usd * (cost_bps_leg / 10_000.0)
-    hard_level = max(float(HARD_SL_USD), float(HARD_SL_PCT) * notional)
+    hard_level = max(float(params["hard_sl_usd"]), float(params["hard_sl_pct"]) * notional)
 
-    lo = max(test_start, WINDOW + 1)
+    lo = max(test_start, window + 1)
     for i in range(lo, test_end):
         z = z_series[i]
         if z is None or (isinstance(z, float) and np.isnan(z)):
             continue
 
         if state == "flat":
-            if abs(z) >= ZSCORE_THRESH:
+            if abs(z) >= z_entry_thr:
                 state = "in_trade"
                 entry_z = z
                 entry_i = i
@@ -249,26 +272,24 @@ def simulate_test(p1_full, p2_full, test_start, test_end, hedge_ratio, half_life
         net = pnl_gross - exec_cost - funding
 
         reason = None
-        # 1) HARD_SL monetario (paridad live)
-        if pnl_gross <= -hard_level:
+        # 1) HARD_SL monetario — sólo en stop_mode='monetary'
+        if stop_mode == "monetary" and pnl_gross <= -hard_level:
             reason = "HARD_SL"
-        # 2) Z_SL
-        elif abs(z) >= abs(entry_z) + Z_SL_DELTA:
+        # 2) Z_SL (tesis rota) — siempre activo
+        elif abs(z) >= abs(entry_z) + z_sl_delta:
             reason = "Z_SL"
         # 2b) TP_CROSSED_ZERO (gate relajado: net>0)
         elif ((entry_z > 0.1 and z < -0.1) or (entry_z < -0.1 and z > 0.1)) and net > 0:
             reason = "TP_CROSSED_ZERO"
-        # 3) TP con doble confirmación + profit gate
+        # 3) TP con confirmación + profit gate
         else:
-            if abs(z) <= Z_TP:
+            if abs(z) <= z_tp:
                 tp_confirm += 1
             else:
                 tp_confirm = 0
-            if tp_confirm >= TP_CONFIRM_CHECKS:
-                if net > 0:
-                    reason = "TP"
-                # si pnl_gross<0 → HOLD (política jun30), no cerrar
-        if reason is None and hold >= 500:
+            if tp_confirm >= tp_confirm_req and net > 0:
+                reason = "TP"
+        if reason is None and hold >= time_stop_bars:
             reason = "TIME_STOP"
 
         if reason:
@@ -329,73 +350,42 @@ def metrics(trades, usd, years):
     }
 
 
-def main():
-    ap = argparse.ArgumentParser(description="Backtest walk-forward honesto")
-    ap.add_argument("--bars", type=int, default=2160, help="Barras totales a bajar (90d)")
-    ap.add_argument("--train", type=int, default=336, help="Barras de entrenamiento por fold (14d)")
-    ap.add_argument("--test", type=int, default=168, help="Barras de test por fold (7d)")
-    ap.add_argument("--top", type=int, default=None, help="Sólo los N primeros pares del CSV")
-    ap.add_argument("--usd", type=float, default=float(USD_PER_TRADE), help="USD por pierna")
-    ap.add_argument("--cost-bps-per-leg", type=float, default=40.0,
-                    help="Coste por pierna (fee+slippage+½spread) en bps. Mainnet altcoins ~40-200.")
-    ap.add_argument("--funding-bps-day", type=float, default=3.0, help="Drag de funding en bps/día")
-    ap.add_argument("--workers", type=int, default=6, help="Descargas concurrentes de candles")
-    args = ap.parse_args()
+def build_params(args, window=None, z_entry=None, z_tp=None, stop_mode=None):
+    return {
+        "window": int(window if window is not None else (args.window or WINDOW)),
+        "z_entry": float(z_entry if z_entry is not None else (args.z_entry or ZSCORE_THRESH)),
+        "z_tp": float(z_tp if z_tp is not None else (args.z_tp or Z_TP)),
+        "z_sl_delta": float(Z_SL_DELTA),
+        "tp_confirm": int(TP_CONFIRM_CHECKS),
+        "hard_sl_usd": float(HARD_SL_USD),
+        "hard_sl_pct": float(HARD_SL_PCT),
+        "stop_mode": stop_mode if stop_mode is not None else args.stop,
+        "time_stop_bars": 500,
+    }
 
-    if not CSV_PATH.exists():
-        print(f"ERROR: falta {CSV_PATH}")
-        return
-    pairs = pd.read_csv(CSV_PATH)
-    if args.top:
-        pairs = pairs.head(args.top)
 
-    print(f"\n{'='*72}")
-    print(f"  BACKTEST WALK-FORWARD  |  {len(pairs)} pares CSV")
-    print(f"  bars={args.bars} train={args.train} test={args.test} usd=${args.usd:.0f}")
-    print(f"  cost/leg={args.cost_bps_per_leg}bps  funding={args.funding_bps_day}bps/día")
-    print(f"  z_entry={ZSCORE_THRESH} z_tp={Z_TP} z_sl_delta={Z_SL_DELTA} "
-          f"hard_sl=${HARD_SL_USD} window={WINDOW}")
-    print(f"{'='*72}\n")
-
-    # ── Prefetch de mercados únicos (con progreso, paralelo, backoff) ──────
-    unique_markets = set()
-    _pair_list = []
-    for _, row in pairs.iterrows():
-        m1 = str(row.get("base_market", row.get("sym_1", ""))).strip()
-        m2 = str(row.get("quote_market", row.get("sym_2", ""))).strip()
-        if m1 and m2:
-            unique_markets.add(m1)
-            unique_markets.add(m2)
-            _pair_list.append((m1, m2))
-    cache = prefetch_markets(sorted(unique_markets), args.bars, workers=args.workers)
-    print(f"Prefetch listo. Corriendo walk-forward sobre {len(_pair_list)} pares...\n", flush=True)
-
-    def get(m):
-        return cache.get(m)
-
+def run_walk_forward(pairs, cache, unique_markets, args, params):
+    """Walk-forward con los `params` dados. Devuelve dict con métricas y meta."""
     all_trades = []
     folds_used = 0
     selections = 0
     first_test_ts = None
     last_test_ts = None
     pairs_run = 0
-
     for _, row in pairs.iterrows():
         m1 = str(row.get("base_market", row.get("sym_1", ""))).strip()
         m2 = str(row.get("quote_market", row.get("sym_2", ""))).strip()
         if not m1 or not m2:
             continue
-        s1 = get(m1)
-        s2 = get(m2)
+        s1 = cache.get(m1)
+        s2 = cache.get(m2)
         if not s1 or not s2:
             continue
         ts, p1, p2 = align_by_ts(s1, s2)
         n = len(p1)
-        if n < args.train + args.test + WINDOW + 5:
+        if n < args.train + args.test + 5:
             continue
         pairs_run += 1
-
-        # Walk-forward: rueda por ventanas de test no solapadas.
         start = 0
         while start + args.train + args.test <= n:
             tr0, tr1 = start, start + args.train
@@ -403,10 +393,8 @@ def main():
             passes, hr, hl = train_select(p1[tr0:tr1], p2[tr0:tr1])
             if passes:
                 selections += 1
-                # Simula sobre la serie completa pero acotado a [te0, te1);
-                # el z usa ventana rodante (pasado) con el hedge_ratio de TRAIN.
                 trs = simulate_test(p1, p2, te0, te1, hr, hl,
-                                    args.usd, args.cost_bps_per_leg, args.funding_bps_day)
+                                    args.usd, args.cost_bps_per_leg, args.funding_bps_day, params)
                 for t in trs:
                     t["pair"] = f"{m1}/{m2}"
                 all_trades.extend(trs)
@@ -419,7 +407,6 @@ def main():
                         last_test_ts = ts[ci] if last_test_ts is None else max(last_test_ts, ts[ci])
             start += args.test
 
-    # años cubiertos por el periodo de test
     years = 1.0
     if first_test_ts and last_test_ts:
         try:
@@ -428,12 +415,123 @@ def main():
             years = max((d1 - d0).total_seconds() / (365 * 86400), 1e-6)
         except Exception:
             pass
-
     m = metrics(all_trades, args.usd, years)
-    # ── Aviso de SUPERVIVENCIA (los ilíquidos sin historia quedan fuera) ──
     n_unique = len(unique_markets)
     n_ok = sum(1 for v in cache.values() if v)
-    n_dropped = n_unique - n_ok
+    return {"m": m, "years": years, "pairs_run": pairs_run, "selections": selections,
+            "folds_used": folds_used, "first_test_ts": first_test_ts, "last_test_ts": last_test_ts,
+            "n_unique": n_unique, "n_ok": n_ok, "n_dropped": n_unique - n_ok}
+
+
+def _prefetch_for(pairs, args):
+    unique_markets = set()
+    for _, row in pairs.iterrows():
+        m1 = str(row.get("base_market", row.get("sym_1", ""))).strip()
+        m2 = str(row.get("quote_market", row.get("sym_2", ""))).strip()
+        if m1 and m2:
+            unique_markets.add(m1)
+            unique_markets.add(m2)
+    cache = prefetch_markets(sorted(unique_markets), args.bars, workers=args.workers)
+    return unique_markets, cache
+
+
+def run_sweep(pairs, cache, unique_markets, args):
+    """Barre window × z_entry × z_tp × stop y rankea por NET PnL."""
+    from itertools import product
+    windows = [21, 84, 168, 504]
+    z_entries = [2.7, 3.0]
+    z_tps = [0.3, 0.7]
+    stops = ["monetary", "zonly"]
+    combos = list(product(windows, z_entries, z_tps, stops))
+    print(f"SWEEP: {len(combos)} combinaciones (coste {args.cost_bps_per_leg}bps/pierna)\n")
+    rows = []
+    for (w, ze, zt, st) in combos:
+        params = build_params(args, window=w, z_entry=ze, z_tp=zt, stop_mode=st)
+        res = run_walk_forward(pairs, cache, unique_markets, args, params)
+        m = res["m"]
+        rows.append({
+            "window": w, "z_entry": ze, "z_tp": zt, "stop": st,
+            "n": m.get("n", 0), "wr": m.get("win_rate", 0), "pf": m.get("profit_factor", 0),
+            "ev": m.get("ev_per_trade", 0), "net": m.get("net_pnl", 0),
+            "sharpe": m.get("sharpe_annual", 0), "dd": m.get("max_drawdown", 0),
+        })
+    rows.sort(key=lambda r: r["net"], reverse=True)
+    print(f"  {'win':>4} {'z_in':>4} {'z_tp':>4} {'stop':>8} {'n':>5} {'WR%':>6} {'PF':>6} "
+          f"{'EV$':>8} {'NET$':>9} {'Shrp':>6} {'maxDD$':>8}")
+    print("  " + "-" * 80)
+    for r in rows:
+        flag = " OK" if (r["net"] > 0 and r["ev"] > 0 and r["n"] >= 20) else ""
+        print(f"  {r['window']:>4} {r['z_entry']:>4} {r['z_tp']:>4} {r['stop']:>8} "
+              f"{r['n']:>5} {r['wr']:>6} {r['pf']:>6} {r['ev']:>8.4f} {r['net']:>9.2f} "
+              f"{r['sharpe']:>6} {r['dd']:>8}{flag}")
+    winners = [r for r in rows if r["net"] > 0 and r["ev"] > 0 and r["n"] >= 20]
+    print()
+    if winners:
+        b = winners[0]
+        print(f"  🎯 Mejor combo con EV>0 y n>=20: window={b['window']} z_entry={b['z_entry']} "
+              f"z_tp={b['z_tp']} stop={b['stop']} → NET=${b['net']} EV=${b['ev']} WR={b['wr']}%")
+        print(f"     (compáralo también a --cost-bps-per-leg 100 y 150 antes de decidir.)")
+    else:
+        print(f"  🛑 NINGUNA combinación da EV>0 con n>=20 a {args.cost_bps_per_leg}bps/pierna.")
+        print(f"     A este coste la geometría no se arregla con parámetros → revisar")
+        print(f"     tesis/mercado o probar coste menor (pares más líquidos).")
+    print(f"\n  Recordatorio: gross al MID, ejecución perfecta. Es sensibilidad RELATIVA")
+    print(f"  entre combos, NO prueba de GO. La verdad es reconcile_pnl.py en vivo.\n")
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Backtest walk-forward honesto")
+    ap.add_argument("--bars", type=int, default=2160, help="Barras totales a bajar (90d)")
+    ap.add_argument("--train", type=int, default=336, help="Barras de entrenamiento por fold (14d)")
+    ap.add_argument("--test", type=int, default=168, help="Barras de test por fold (7d)")
+    ap.add_argument("--top", type=int, default=None, help="Sólo los N primeros pares del CSV")
+    ap.add_argument("--usd", type=float, default=float(USD_PER_TRADE), help="USD por pierna")
+    ap.add_argument("--cost-bps-per-leg", type=float, default=40.0,
+                    help="Coste por pierna (fee+slippage+½spread) en bps. Mainnet altcoins ~40-200.")
+    ap.add_argument("--funding-bps-day", type=float, default=3.0, help="Drag de funding en bps/día")
+    ap.add_argument("--workers", type=int, default=6, help="Descargas concurrentes de candles")
+    ap.add_argument("--sweep", action="store_true", help="Barrido window/z_entry/z_tp/stop")
+    ap.add_argument("--stop", default="monetary", choices=["monetary", "zonly"],
+                    help="single-run: monetary (HARD_SL) o zonly (sólo Z_SL, sin stop apretado)")
+    ap.add_argument("--window", type=int, default=None, help="Override z-window (default constants.WINDOW)")
+    ap.add_argument("--z-entry", type=float, default=None, help="Override umbral de entrada")
+    ap.add_argument("--z-tp", type=float, default=None, help="Override umbral de TP")
+    args = ap.parse_args()
+
+    if not CSV_PATH.exists():
+        print(f"ERROR: falta {CSV_PATH}")
+        return
+    pairs = pd.read_csv(CSV_PATH)
+    if args.top:
+        pairs = pairs.head(args.top)
+
+    print(f"\n{'='*72}")
+    print(f"  BACKTEST WALK-FORWARD  |  {len(pairs)} pares CSV  |  {'SWEEP' if args.sweep else 'single'}")
+    print(f"  bars={args.bars} train={args.train} test={args.test} usd=${args.usd:.0f} "
+          f"cost/leg={args.cost_bps_per_leg}bps")
+    print(f"{'='*72}\n")
+
+    unique_markets, cache = _prefetch_for(pairs, args)
+    print(f"Prefetch listo.\n", flush=True)
+
+    if args.sweep:
+        run_sweep(pairs, cache, unique_markets, args)
+        return
+
+    params = build_params(args)
+    print(f"Params: window={params['window']} z_entry={params['z_entry']} "
+          f"z_tp={params['z_tp']} stop={params['stop_mode']}\n")
+    res = run_walk_forward(pairs, cache, unique_markets, args, params)
+    m = res["m"]
+    years = res["years"]
+    pairs_run = res["pairs_run"]
+    selections = res["selections"]
+    folds_used = res["folds_used"]
+    first_test_ts = res["first_test_ts"]
+    last_test_ts = res["last_test_ts"]
+    n_unique = res["n_unique"]
+    n_ok = res["n_ok"]
+    n_dropped = res["n_dropped"]
     print(f"  Mercados únicos CSV:     {n_unique}")
     print(f"  Con datos suficientes:   {n_ok}   (descartados: {n_dropped})")
     if n_unique and n_dropped / n_unique > 0.30:

@@ -584,9 +584,14 @@ def main():
         print(f"  (altcoins mainnet) tiene spreads de 40-200 bps → corre también")
         print(f"  --cost-bps-per-leg {int(be_bps)+10} y 150 para ver la sensibilidad.")
 
-    verdict_ok = m['net_pnl'] > 0 and m['ev_per_trade'] > 0
-    print(f"\n  Veredicto (a {args.cost_bps_per_leg:.0f}bps): "
-          f"{'✅ EV NETO > 0 OOS' if verdict_ok else '🛑 EV NETO ≤ 0 OOS — no desplegar'}")
+    if m.get("n", 0) < 20:
+        print(f"\n  Veredicto: ⚠️  INCONCLUYENTE — n={m.get('n',0)} < 20 (muestra insuficiente).")
+        print(f"  Sólo {selections} folds pasaron la cointegración de {pairs_run} pares: la")
+        print(f"  cointegración NO persiste al re-testear → señal espuria, no un edge medible.")
+    else:
+        verdict_ok = m['net_pnl'] > 0 and m['ev_per_trade'] > 0
+        print(f"\n  Veredicto (a {args.cost_bps_per_leg:.0f}bps): "
+              f"{'✅ EV NETO > 0 OOS' if verdict_ok else '🛑 EV NETO ≤ 0 OOS — no desplegar'}")
     print(f"  ⚠️  RECORDATORIO: el gross se captura al MID con ejecución perfecta")
     print(f"      (sin legging ni whipsaw de 30s). La verdad es la reconciliación de")
     print(f"      fills reales (reconcile_pnl.py), no este backtest. Úsalo sólo para")

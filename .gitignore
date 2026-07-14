@@ -17,6 +17,7 @@ bot.pid
 # Datos generados — se regeneran solos
 program/cointegrated_pairs.csv
 program/market_prices.pkl
+fx/fx_cache/
 
 # Python
 __pycache__/

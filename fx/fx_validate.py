@@ -88,6 +88,19 @@ def simulate(p1, p2, te0, te1, hr, usd, cost_bps_leg, carry_bps_day, prm):
         if reason:
             trades.append({"net": net, "gross": pnl, "hold": hold, "reason": reason})
             state = "flat"; conf = 0
+    # BUGFIX: cerrar (mark-to-market) cualquier posición ABIERTA al final de la
+    # ventana. Antes se descartaban → solo sobrevivían las ganadoras (WR 100%
+    # falso). Ahora las contamos, capturando también las perdedoras.
+    if state == "in":
+        i = te1 - 1
+        hold = i - ei
+        s1 = usd / ep1; s2 = usd / ep2
+        if side == "short":
+            pnl = (ep1 - p1[i]) * s1 + (p2[i] - ep2) * s2
+        else:
+            pnl = (p1[i] - ep1) * s1 + (ep2 - p2[i]) * s2
+        carry = carry_bps_day / 10_000.0 * (2.0 * usd) * hold
+        trades.append({"net": pnl - exec_cost - carry, "gross": pnl, "hold": hold, "reason": "EOW"})
     return trades
 
 
@@ -176,12 +189,20 @@ def main():
     wr = len(wins) / n * 100
     pf = wins.sum() / abs(losses.sum()) if len(losses) and losses.sum() != 0 else float("inf")
     ev = net.mean()
-    # Sharpe anualizado aproximado (retorno por trade × trades/año). Los folds
-    # cubren ~ (fold_opportunities×test) días naturales del histórico.
-    span_days = fold_opportunities * args.test if fold_opportunities else 252
-    years = max(span_days / 365.0, 1e-6)
+    # Años de CALENDARIO reales del dataset (no fold_opportunities×test, que
+    # multiplicaba por nº de pares y rompía Sharpe/throughput).
+    all_dates = []
+    for s in syms:
+        if data.get(s):
+            all_dates.append(data[s][0][0]); all_dates.append(data[s][-1][0])
+    try:
+        d0 = min(all_dates); d1 = max(all_dates)
+        years = max((datetime.strptime(d1, "%Y-%m-%d") - datetime.strptime(d0, "%Y-%m-%d")).days / 365.0, 1e-6)
+    except Exception:
+        years = 1.0
     r = net / args.usd
-    sharpe = (r.mean() / r.std() * np.sqrt(n / years)) if r.std() > 0 else 0.0
+    tpy = n / years
+    sharpe = (r.mean() / r.std() * np.sqrt(tpy)) if r.std() > 0 and tpy > 0 else 0.0
     print(f"  Trades:         {n}   ({n/years:.0f}/año aprox)")
     print(f"  Win rate:       {wr:.1f}%")
     print(f"  Profit factor:  {pf:.2f}")

@@ -23,7 +23,7 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 
-from fx_data import DEFAULT_UNIVERSE, fetch_daily, align_by_date
+from fx_data import DEFAULT_UNIVERSE, load_universe, align_by_date
 from coint import calculate_cointegration, calculate_hurst_exponent, zscore
 
 # Filtros de selección (por fold), análogos al bot pero en días.
@@ -116,14 +116,12 @@ def main():
     print(f"  z_entry={args.z_entry} z_tp={args.z_tp}  cost={args.cost_bps_per_leg}bps/pierna "
           f"carry={args.carry_bps_day}bps/día\n")
 
-    # Descarga (cacheada)
-    data = {}
-    for i, sym in enumerate(universe, 1):
-        rows = fetch_daily(sym)
-        if rows:
-            data[sym] = rows
-        print(f"   [{i}/{len(universe)}] {sym}: {len(rows) if rows else 0} días")
-    syms = [s for s in universe if s in data]
+    # Descarga (una sola llamada al BCE/Frankfurter, cacheada)
+    data = load_universe(universe)
+    for sym in universe:
+        s = sym.lower().strip()
+        print(f"   {s}: {len(data.get(s, [])) } días")
+    syms = [s.lower().strip() for s in universe if s.lower().strip() in data]
     if len(syms) < 2:
         print("  ❌ No hay datos suficientes.")
         return

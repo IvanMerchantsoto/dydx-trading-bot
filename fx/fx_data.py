@@ -1,26 +1,30 @@
 # fx/fx_data.py
 """
-Descarga de precios FX DIARIOS gratis desde Yahoo Finance (sin API key, sin
-cuenta). Endpoint chart v8: keyless, años de historia, solo requiere User-Agent.
+Precios FX DIARIOS gratis desde Frankfurter (tasas de referencia del BCE).
+Keyless, pensado para acceso programático → NO bloquea IPs de datacenter
+(a diferencia de stooq/Yahoo, que rechazan Google Cloud). Historia desde 1999.
 
-  https://query1.finance.yahoo.com/v8/finance/chart/EURUSD=X?range=max&interval=1d
+  https://api.frankfurter.app/2007-01-01..2026-07-13?from=USD&to=EUR,GBP,JPY,...
 
-Símbolos Yahoo FX = TICKER + "=X" (EURUSD=X, USDJPY=X, EURGBP=X, ...).
-Suficiente para VALIDAR cointegración FX. Los datos live vendrán del bróker.
+Son tasas de referencia (un fix diario, días hábiles), no bid/ask tradeable —
+PERFECTO para VALIDAR si la cointegración existe y persiste. Los precios
+tradeables intradía vendrán del bróker en la Fase 2.
 """
-import csv
-import io
+import json
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+import numpy as np
 import requests
 
 CACHE = Path(__file__).parent / "fx_cache"
 CACHE.mkdir(exist_ok=True)
 _S = requests.Session()
-_UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                     "(KHTML, like Gecko) Chrome/122.0 Safari/537.36"}
+FRANK = "https://api.frankfurter.app"
+
+# Divisas que aparecen en el universo (además de USD, que es la base).
+CCYS = ["EUR", "GBP", "JPY", "CHF", "AUD", "CAD", "NZD"]
 
 DEFAULT_UNIVERSE = [
     "eurusd", "gbpusd", "usdjpy", "usdchf", "audusd", "usdcad", "nzdusd",
@@ -28,88 +32,73 @@ DEFAULT_UNIVERSE = [
 ]
 
 
-def fetch_daily(symbol, cache_h=24.0, min_rows=300):
-    """
-    Devuelve [(date_str, close_float), ...] ascendente, o None si falla.
-    Cachea en fx_cache/{symbol}.csv (Date,Close).
-    """
-    symbol = symbol.lower().strip()
-    cf = CACHE / f"{symbol}.csv"
+def _fetch_base_usd(start="2007-01-01", cache_h=24.0):
+    """Serie temporal de tasas USD→{CCYS} (una llamada). Cachea el JSON crudo."""
+    cf = CACHE / "frankfurter_usd.json"
     if cf.exists() and (time.time() - cf.stat().st_mtime) / 3600.0 < cache_h:
         try:
-            rows = _parse(cf.read_text())
-            if len(rows) >= min_rows:
-                return rows
+            j = json.loads(cf.read_text())
+            if j.get("rates"):
+                return j
         except Exception:
             pass
-
-    ysym = symbol.upper() + "=X"
-    rows = None
-    last_err = None
-    for host in ("query1", "query2"):
-        url = (f"https://{host}.finance.yahoo.com/v8/finance/chart/{ysym}"
-               f"?range=max&interval=1d")
+    end = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    to = ",".join(CCYS)
+    urls = [
+        f"{FRANK}/{start}..{end}?from=USD&to={to}",
+        f"{FRANK}/{start}..{end}?base=USD&symbols={to}",   # forma antigua, por si acaso
+    ]
+    last = None
+    for url in urls:
         for attempt in range(3):
             try:
-                r = _S.get(url, headers=_UA, timeout=25)
+                r = _S.get(url, timeout=30)
                 if r.status_code in (429, 500, 502, 503):
                     time.sleep(0.8 * (2 ** attempt)); continue
                 r.raise_for_status()
                 j = r.json()
-                res = j["chart"]["result"][0]
-                ts = res["timestamp"]
-                closes = res["indicators"]["quote"][0]["close"]
-                rows = []
-                for t, c in zip(ts, closes):
-                    if c is None:
-                        continue
-                    d = datetime.fromtimestamp(t, tz=timezone.utc).strftime("%Y-%m-%d")
-                    rows.append((d, float(c)))
-                break
+                if j.get("rates"):
+                    try:
+                        cf.write_text(json.dumps(j))
+                    except Exception:
+                        pass
+                    return j
             except Exception as e:
-                last_err = e
+                last = e
                 time.sleep(0.5 * (2 ** attempt))
-        if rows:
-            break
-    if not rows:
-        print(f"  [fx_data] fetch error {symbol}: {last_err}")
-        return None
-    # dedup por fecha (Yahoo puede repetir la última) y ordenar
-    dd = {}
-    for d, c in rows:
-        dd[d] = c
-    rows = sorted(dd.items(), key=lambda x: x[0])
-    if len(rows) < min_rows:
-        print(f"  [fx_data] {symbol}: sólo {len(rows)} filas.")
-        return rows if rows else None
-    try:
-        out = io.StringIO()
-        w = csv.writer(out); w.writerow(["Date", "Close"])
-        w.writerows(rows)
-        cf.write_text(out.getvalue())
-    except Exception:
-        pass
-    return rows
+    print(f"  [fx_data] Frankfurter falló: {last}")
+    return None
 
 
-def _parse(text):
-    out = []
-    for row in csv.DictReader(io.StringIO(text)):
-        d = row.get("Date")
-        c = row.get("Close")
-        if not d or c in (None, "", "N/D", "null"):
-            continue
-        try:
-            out.append((d, float(c)))
-        except Exception:
-            continue
-    out.sort(key=lambda x: x[0])
+def load_universe(symbols):
+    """
+    Devuelve {sym: [(date, close), ...]} derivando cada par de las tasas USD.
+    price(base/quote) = (USD→quote) / (USD→base), con USD→USD = 1.
+    """
+    j = _fetch_base_usd()
+    if not j:
+        return {}
+    rates = j.get("rates", {})   # {date: {CUR: val}}
+    out = {}
+    for sym in symbols:
+        s = sym.lower().strip()
+        base, quote = s[:3].upper(), s[3:].upper()
+        rows = []
+        for date in sorted(rates):
+            r = rates[date]
+            bv = 1.0 if base == "USD" else r.get(base)
+            qv = 1.0 if quote == "USD" else r.get(quote)
+            if bv and qv and bv > 0:
+                rows.append((date, qv / bv))
+        if len(rows) >= 300:
+            out[s] = rows
+        else:
+            print(f"  [fx_data] {s}: sólo {len(rows)} días (divisa ausente en BCE?)")
     return out
 
 
 def align_by_date(rows_1, rows_2):
     """Alinea dos series [(date, close)] por fecha común."""
-    import numpy as np
     d1 = dict(rows_1); d2 = dict(rows_2)
     common = sorted(set(d1) & set(d2))
     p1 = np.array([d1[d] for d in common], dtype=float)

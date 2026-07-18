@@ -14,14 +14,26 @@ from constants import (
     MIN_HOLD_MINUTES_FOR_TP,
     TRAIL_TP_ENABLED, TRAIL_Z_PULLBACK, TRAIL_Z_FLOOR,
     SL_COOLDOWN_ENABLED, SL_COOLDOWN_MIN_HOURS, SL_COOLDOWN_HALFLIFE_MULT,
-    MARKET_MAX_SLIPPAGE_BPS_EXIT, MARKET_MAX_SLIPPAGE_BPS_FLATTEN,
+    MARKET_MAX_SLIPPAGE_BPS_TP, MARKET_MAX_SLIPPAGE_BPS_EXIT,
+    MARKET_MAX_SLIPPAGE_BPS_FLATTEN, EXIT_PNL_RESERVE_BPS,
+    ADAPTIVE_TIME_STOP_ENABLED, ADAPTIVE_TIME_STOP_HALFLIVES,
+    ADAPTIVE_TIME_STOP_MIN_HOURS, ADAPTIVE_TIME_STOP_MAX_HOURS,
+    CONVERGED_LOSS_EXIT_ENABLED, CONVERGED_LOSS_MIN_PROGRESS,
+    CONVERGED_LOSS_MIN_HALFLIVES, CONVERGED_LOSS_MAX_SPREAD_BPS,
+    MARKET_MAX_SLIPPAGE_BPS_CONVERGED_LOSS,
 )
 from func_utils import format_number
-from func_public import get_candles_recent
+from func_public import get_candles_recent, get_market_spread_bps
 from func_cointegration import calculate_zscore
-from func_private import place_market_order, close_pair_maker_with_fallback, get_real_fill_details
+from func_private import (
+    place_market_order, close_pair_maker_with_fallback, get_real_fill_details,
+    get_orderbook_best,
+)
 from constants import MAKER_EXIT_ENABLED, MAKER_EXIT_TIMEOUT_S
 from func_logging import log_event
+from func_strategy import (
+    spread_convergence_progress, fee_with_fallback, conservative_close_price,
+)
 from v4_proto.dydxprotocol.clob.order_pb2 import Order
 
 import json
@@ -62,7 +74,7 @@ def _pair_key_exit(m1: str, m2: str) -> str:
 
 
 def _write_sl_cooldown(m1: str, m2: str, half_life: float):
-    """Escribe un cooldown de re-entrada tras SL/HARD_SL para el par m1/m2."""
+    """Write a cooldown after any risk/thesis-failure exit."""
     if not SL_COOLDOWN_ENABLED:
         return
     try:
@@ -239,6 +251,82 @@ async def _close_single_live_leg(node, indexer, wallet, markets, market, live_si
     })
 
 
+async def _get_exit_spreads_cached(indexer, position, m1, m2, now_utc, ttl_seconds=300):
+    """Read both live spreads, reusing a short-lived value across exit loops."""
+    checked_at = _parse_opened_at(position.get("exit_liquidity_checked_at"))
+    if checked_at is not None:
+        age_s = (now_utc - checked_at).total_seconds()
+        if 0 <= age_s < float(ttl_seconds):
+            return (
+                position.get("exit_spread_1_bps"),
+                position.get("exit_spread_2_bps"),
+            )
+    spread_1 = await get_market_spread_bps(indexer, m1)
+    spread_2 = await get_market_spread_bps(indexer, m2)
+    position["exit_liquidity_checked_at"] = now_utc.isoformat().replace("+00:00", "Z")
+    position["exit_spread_1_bps"] = spread_1
+    position["exit_spread_2_bps"] = spread_2
+    return spread_1, spread_2
+
+
+async def _refresh_estimated_entry_fills(indexer, position, now_utc, ttl_seconds=300):
+    """Replace provisional entry prices/fees once authoritative fills appear."""
+    estimated = [
+        bool(position.get("entry_price_1_estimated", position.get("fee_1_estimated", False))),
+        bool(position.get("entry_price_2_estimated", position.get("fee_2_estimated", False))),
+    ]
+    if not any(estimated):
+        return
+    checked_at = _parse_opened_at(position.get("entry_fill_reconcile_checked_at"))
+    if checked_at is not None:
+        age_s = (now_utc - checked_at).total_seconds()
+        if 0 <= age_s < float(ttl_seconds):
+            return
+    position["entry_fill_reconcile_checked_at"] = now_utc.isoformat().replace("+00:00", "Z")
+
+    specs = [
+        (1, position.get("market_1"), position.get("order_id_m1")),
+        (2, position.get("market_2"), position.get("order_id_m2")),
+    ]
+    tasks = []
+    task_legs = []
+    for leg, market, client_id in specs:
+        if estimated[leg - 1] and market and client_id:
+            tasks.append(get_real_fill_details(indexer, client_id, market, max_fill_lookback=200))
+            task_legs.append(leg)
+    if not tasks:
+        return
+    details = await asyncio.gather(*tasks, return_exceptions=True)
+    for leg, detail in zip(task_legs, details):
+        if isinstance(detail, Exception):
+            continue
+        avg_price = _sf(detail.get("avg_price"), 0.0)
+        filled_size = _sf(detail.get("filled_size"), 0.0)
+        if avg_price <= 0 or filled_size <= 0:
+            continue
+        old_price = _sf(position.get(f"price_{leg}"), 0.0)
+        position[f"price_{leg}"] = avg_price
+        position[f"avg_entry_price_{leg}"] = avg_price
+        position[f"size_{leg}"] = filled_size
+        position[f"filled_size_{leg}"] = filled_size
+        position[f"filled_usd_{leg}"] = filled_size * avg_price
+        position[f"entry_price_{leg}_estimated"] = False
+        fee = _sf(detail.get("fee_total"), 0.0)
+        if fee > 0:
+            position[f"fee_{leg}"] = fee
+            position[f"fee_{leg}_estimated"] = bool(detail.get("fee_estimated", False))
+        log_event({
+            "type": "entry_fill_reconciled",
+            "trace_id": position.get("trace_id"),
+            "market": position.get(f"market_{leg}"),
+            "leg": leg,
+            "old_entry_price": old_price,
+            "real_entry_price": avg_price,
+            "filled_size": filled_size,
+            "fee": fee,
+        }, print_terminal=False)
+
+
 async def manage_trade_exits(node, indexer, wallet):
     try:
         with open(JSON_PATH, "r") as f:
@@ -379,6 +467,17 @@ async def manage_trade_exits(node, indexer, wallet):
                 continue
 
         # ── Both legs live: evaluate exit conditions ──────────────────────
+        try:
+            await _refresh_estimated_entry_fills(indexer, position, now_utc)
+        except Exception as _entry_reconcile_error:
+            log_event({
+                "type": "entry_fill_reconcile_error",
+                "trace_id": trace_id,
+                "m1": m1,
+                "m2": m2,
+                "error": str(_entry_reconcile_error),
+            }, print_terminal=False)
+
         z_entry = _sf(position.get("z_score", 0.0))
 
         opened_at = _parse_opened_at(position.get("opened_at"))
@@ -472,7 +571,9 @@ async def manage_trade_exits(node, indexer, wallet):
             position["z_now"] = float(z_now)
             # (if z_now is None this loop, keep whatever best_z we had)
 
-        # PnL calculation (proxy using oracle prices)
+        # PnL calculation at executable top-of-book prices.  Oracle marks can
+        # show a profit that disappears when both books are crossed; production
+        # fills showed this was the main source of false-positive TP exits.
         can_pnl = _has_pnl_fields(position)
 
         entry1_side = position.get("side_1") or position.get("entry_side_1")
@@ -482,14 +583,31 @@ async def manage_trade_exits(node, indexer, wallet):
         entry1_size = _sf(position.get("size_1") or position.get("entry_size_1"), 0.0)
         entry2_size = _sf(position.get("size_2") or position.get("entry_size_2"), 0.0)
 
-        exit1_price = _sf(markets.get(m1, {}).get("oraclePrice"), 0.0)
-        exit2_price = _sf(markets.get(m2, {}).get("oraclePrice"), 0.0)
+        mark_exit1_price = _sf(markets.get(m1, {}).get("oraclePrice"), 0.0)
+        mark_exit2_price = _sf(markets.get(m2, {}).get("oraclePrice"), 0.0)
+        close_side_preview_1 = "SELL" if float(live_pos[m1]) > 0 else "BUY"
+        close_side_preview_2 = "SELL" if float(live_pos[m2]) > 0 else "BUY"
+        (bid1, ask1), (bid2, ask2) = await asyncio.gather(
+            get_orderbook_best(indexer, m1),
+            get_orderbook_best(indexer, m2),
+        )
+        exit1_price, exit1_source = conservative_close_price(
+            close_side_preview_1, bid1, ask1, mark_exit1_price, EXIT_PNL_RESERVE_BPS
+        )
+        exit2_price, exit2_source = conservative_close_price(
+            close_side_preview_2, bid2, ask2, mark_exit2_price, EXIT_PNL_RESERVE_BPS
+        )
 
-        pnl1 = pnl2 = pnl_gross = 0.0
+        pnl1 = pnl2 = pnl_gross = pnl_gross_mark = 0.0
         if can_pnl and exit1_price > 0 and exit2_price > 0:
             pnl1 = leg_pnl(entry1_side, entry1_price, exit1_price, entry1_size)
             pnl2 = leg_pnl(entry2_side, entry2_price, exit2_price, entry2_size)
             pnl_gross = pnl1 + pnl2
+            if mark_exit1_price > 0 and mark_exit2_price > 0:
+                pnl_gross_mark = (
+                    leg_pnl(entry1_side, entry1_price, mark_exit1_price, entry1_size)
+                    + leg_pnl(entry2_side, entry2_price, mark_exit2_price, entry2_size)
+                )
 
         total_notional = _compute_notional(position)
 
@@ -497,13 +615,19 @@ async def manage_trade_exits(node, indexer, wallet):
         # Old positions opened before the fee-tracking fix have fee_1=fee_2=0.
         # In that case, estimate open fees using TAKER_FEE_BPS × open notional
         # so the profit gate isn't too lenient on legacy records.
-        open_fees_paid = _sf(position.get("fee_1", 0.0)) + _sf(position.get("fee_2", 0.0))
-        # Bug #4 fix: track whether open fees were estimated. If yes, the cycle's
-        # net_pnl is provisional and must be flagged as such in trade_closed.
-        open_fees_estimated_fallback = False
-        if open_fees_paid == 0.0 and total_notional > 0.0:
-            open_fees_paid = total_notional * TAKER_FEE_BPS
-            open_fees_estimated_fallback = True
+        entry_notional_1 = abs(entry1_price * entry1_size)
+        entry_notional_2 = abs(entry2_price * entry2_size)
+        fee_1_value, fee_1_fallback = fee_with_fallback(
+            position.get("fee_1", 0.0), entry_notional_1, TAKER_FEE_BPS
+        )
+        fee_2_value, fee_2_fallback = fee_with_fallback(
+            position.get("fee_2", 0.0), entry_notional_2, TAKER_FEE_BPS
+        )
+        open_fees_paid = fee_1_value + fee_2_value
+        # Estimate each missing leg independently.  Production evidence had a
+        # real fee on leg 1 and zero on leg 2; the previous all-or-nothing
+        # fallback therefore understated entry cost.
+        open_fees_estimated_fallback = fee_1_fallback or fee_2_fallback
         # Also propagate the per-leg fee_estimated flag set at open time (testnet)
         fee_estimated_at_open = bool(
             position.get("fee_1_estimated", False)
@@ -523,6 +647,7 @@ async def manage_trade_exits(node, indexer, wallet):
 
         is_close = False
         close_reason = None
+        close_slippage_bps = float(MARKET_MAX_SLIPPAGE_BPS_EXIT)
 
         # ── 1. Hard monetary SL ───────────────────────────────────────────
         if (not is_close) and USE_HARD_SL and can_pnl:
@@ -570,25 +695,23 @@ async def manage_trade_exits(node, indexer, wallet):
         # cuando pnl era chico pero POSITIVO. Ejemplo: pnl=$0.20, gate requiere
         # $0.30+ → bot esperaba más, luego el spread revertía a pérdida.
         #
-        # FIX 2026-07-12: para TP_CROSSED_ZERO, solo requerir net_pnl_est > 0
-        # (cubrir fees + slippage). Sin gate estricto de MIN_PROFIT.
-        # Rationale: si el z cruzó cero, la tesis se cumplió — capturar lo que
-        # haya de profit antes que el spread revierta.
+        # Production fill reconciliation showed that the relaxed net>0 gate
+        # leaves essentially no margin for execution: eight reconciled exits
+        # produced only ~$0.22 combined.  A zero cross remains an immediate
+        # signal, but it must pass the same executable-PnL safety gate as TP.
         if (not is_close) and USE_Z_TP and (z_now is not None):
             zero_crossed = (
                 (z_entry >  0.1 and z_now < -0.1) or
                 (z_entry < -0.1 and z_now >  0.1)
             )
-            zc_net_positive = (
-                zero_crossed and can_pnl and
-                (net_pnl_est is not None) and (net_pnl_est > 0)
-            )
-            if zc_net_positive:
+            zc_profit_safe = zero_crossed and can_pnl and ok_profit
+            if zc_profit_safe:
                 is_close = True
+                close_slippage_bps = float(MARKET_MAX_SLIPPAGE_BPS_TP)
                 close_reason = (
                     f"TP_CROSSED_ZERO: z_entry={z_entry:.3f} → z_now={z_now:.3f} "
                     f"| pnl_gross={pnl_gross:.2f} | net_est={net_pnl_est:.2f} "
-                    f"(relaxed gate: net>0)"
+                    f"| min_gross={min_gross_required:.2f}"
                 )
                 log_event({
                     "type": "tp_zero_crossing_trigger",
@@ -598,7 +721,7 @@ async def manage_trade_exits(node, indexer, wallet):
                     "z_now": round(z_now, 4),
                     "pnl_gross": round(pnl_gross, 4),
                     "net_est": round(net_pnl_est, 4),
-                    "gate_used": "relaxed_net_positive",
+                    "gate_used": "executable_strict_profit",
                 })
 
         # ── 3. Take-Profit (z reversion + confirmation + fee gate) ──────────
@@ -672,6 +795,7 @@ async def manage_trade_exits(node, indexer, wallet):
                 else:
                     if ok_profit:
                         is_close = True
+                        close_slippage_bps = float(MARKET_MAX_SLIPPAGE_BPS_TP)
                         close_reason = (
                             f"TP: abs(z={z_now:.3f}) <= {Z_TP} "
                             f"confirms={tp_confirm} "
@@ -714,6 +838,61 @@ async def manage_trade_exits(node, indexer, wallet):
                             "close_fees_est": close_fees_est,
                         })
 
+        # ── 3b. Frozen-target convergence mismatch ───────────────────────
+        # A rolling z can fall simply because its rolling mean catches up.
+        # Compare current oracle spread against the target frozen at entry.
+        # If that target was genuinely reached after >= one half-life while
+        # economic PnL is still negative, the original thesis is exhausted.
+        convergence_progress = None
+        entry_spread = position.get("entry_spread")
+        entry_target = position.get("entry_spread_target")
+        if (
+            entry_spread is not None and entry_target is not None
+            and mark_exit1_price > 0 and mark_exit2_price > 0
+        ):
+            h = _sf(position.get("hedge_ratio"), 0.0)
+            current_spread = mark_exit1_price - h * mark_exit2_price
+            convergence_progress = spread_convergence_progress(
+                entry_spread, entry_target, current_spread
+            )
+            position["convergence_progress"] = float(convergence_progress)
+
+        if (
+            (not is_close) and CONVERGED_LOSS_EXIT_ENABLED and can_pnl
+            and pnl_gross < 0.0 and convergence_progress is not None
+            and convergence_progress >= float(CONVERGED_LOSS_MIN_PROGRESS)
+            and age_hours is not None
+        ):
+            half_life = max(1.0, _sf(position.get("half_life"), 1.0))
+            min_age = half_life * float(CONVERGED_LOSS_MIN_HALFLIVES)
+            if age_hours >= min_age:
+                spread_1, spread_2 = await _get_exit_spreads_cached(
+                    indexer, position, m1, m2, now_utc
+                )
+                liquid_enough = (
+                    spread_1 is not None and spread_2 is not None
+                    and spread_1 <= float(CONVERGED_LOSS_MAX_SPREAD_BPS)
+                    and spread_2 <= float(CONVERGED_LOSS_MAX_SPREAD_BPS)
+                )
+                log_event({
+                    "type": "converged_loss_evaluated",
+                    "trace_id": trace_id, "m1": m1, "m2": m2,
+                    "progress": round(convergence_progress, 4),
+                    "age_hours": round(age_hours, 3),
+                    "half_life": half_life,
+                    "pnl_gross": round(pnl_gross, 4),
+                    "spread_1_bps": spread_1, "spread_2_bps": spread_2,
+                    "liquid_enough": liquid_enough,
+                }, print_terminal=False)
+                if liquid_enough:
+                    is_close = True
+                    close_slippage_bps = float(MARKET_MAX_SLIPPAGE_BPS_CONVERGED_LOSS)
+                    close_reason = (
+                        f"CONVERGED_LOSS: progress={convergence_progress:.2f} "
+                        f"age={age_hours:.2f}h >= {min_age:.2f}h "
+                        f"| pnl_gross={pnl_gross:.2f} | net_est={net_pnl_est:.2f}"
+                    )
+
         # ── 4. Time Stop (optional — disabled by default) ─────────────────
         if (not is_close) and USE_TIME_STOP and (age_hours is not None):
             if age_hours >= float(TIME_STOP_HOURS):
@@ -723,6 +902,36 @@ async def manage_trade_exits(node, indexer, wallet):
                     f"TIME_STOP: age={age_hours:.2f}h >= {TIME_STOP_HOURS:.2f}h "
                     f"| pnl_gross={pnl_gross:.2f} | net_est={net_pnl_est:.2f}"
                 )
+
+        # Half-life-aware expiry.  Only realizes a losing/flat trade; profitable
+        # trades continue to use normal TP rules.  A liquidity check prevents
+        # the time stop itself from recreating the observed slippage blow-ups.
+        if (
+            (not is_close) and ADAPTIVE_TIME_STOP_ENABLED and can_pnl
+            and net_pnl_est <= 0.0 and age_hours is not None
+        ):
+            half_life = max(1.0, _sf(position.get("half_life"), 1.0))
+            expiry_h = min(
+                float(ADAPTIVE_TIME_STOP_MAX_HOURS),
+                max(float(ADAPTIVE_TIME_STOP_MIN_HOURS),
+                    half_life * float(ADAPTIVE_TIME_STOP_HALFLIVES)),
+            )
+            if age_hours >= expiry_h:
+                spread_1, spread_2 = await _get_exit_spreads_cached(
+                    indexer, position, m1, m2, now_utc
+                )
+                if (
+                    spread_1 is not None and spread_2 is not None
+                    and spread_1 <= float(CONVERGED_LOSS_MAX_SPREAD_BPS)
+                    and spread_2 <= float(CONVERGED_LOSS_MAX_SPREAD_BPS)
+                ):
+                    is_close = True
+                    close_slippage_bps = float(MARKET_MAX_SLIPPAGE_BPS_CONVERGED_LOSS)
+                    close_reason = (
+                        f"ADAPTIVE_TIME_STOP: age={age_hours:.2f}h >= {expiry_h:.2f}h "
+                        f"({ADAPTIVE_TIME_STOP_HALFLIVES:.1f} half-lives) "
+                        f"| pnl_gross={pnl_gross:.2f} | net_est={net_pnl_est:.2f}"
+                    )
 
         if not is_close:
             kept_count += 1
@@ -760,6 +969,13 @@ async def manage_trade_exits(node, indexer, wallet):
                 "z_now": z_now,
                 "z_entry": z_entry,
                 "pnl_gross": pnl_gross,
+                "pnl_gross_mark": pnl_gross_mark,
+                "exit_price_1_decision": exit1_price,
+                "exit_price_2_decision": exit2_price,
+                "exit_price_1_source": exit1_source,
+                "exit_price_2_source": exit2_source,
+                "exit_pnl_reserve_bps": EXIT_PNL_RESERVE_BPS,
+                "max_slippage_bps": close_slippage_bps,
                 "open_fees": open_fees_paid,
                 "close_fees_est": close_fees_est,
                 "net_pnl_est": net_pnl_est,
@@ -819,7 +1035,7 @@ async def manage_trade_exits(node, indexer, wallet):
                     m1, close_side_m1, close_size_m1, markets[m1]["oraclePrice"],
                     True,
                     time_in_force_type=Order.TimeInForce.TIME_IN_FORCE_IOC,
-                    max_slippage_bps=MARKET_MAX_SLIPPAGE_BPS_EXIT,
+                    max_slippage_bps=close_slippage_bps,
                 )
                 await asyncio.sleep(0.5)
                 _close_res_m2 = await place_market_order(
@@ -827,7 +1043,7 @@ async def manage_trade_exits(node, indexer, wallet):
                     m2, close_side_m2, close_size_m2, markets[m2]["oraclePrice"],
                     True,
                     time_in_force_type=Order.TimeInForce.TIME_IN_FORCE_IOC,
-                    max_slippage_bps=MARKET_MAX_SLIPPAGE_BPS_EXIT,
+                    max_slippage_bps=close_slippage_bps,
                 )
                 # Bug #7: capture client_ids so we can poll real fees after the close
                 _close_cid_m1 = (_close_res_m1 or {}).get("order", {}).get("id")
@@ -996,6 +1212,15 @@ async def manage_trade_exits(node, indexer, wallet):
                 "close_type_m1": close_type_m1,
                 "close_type_m2": close_type_m2,
                 "pnl_gross": pnl_gross,
+                "pnl_gross_mark_at_decision": pnl_gross_mark,
+                "pnl_gross_executable_at_decision": (
+                    leg_pnl(entry1_side, entry1_price, exit1_price, entry1_size)
+                    + leg_pnl(entry2_side, entry2_price, exit2_price, entry2_size)
+                    if can_pnl else None
+                ),
+                "entry_price_1_estimated": bool(position.get("entry_price_1_estimated", False)),
+                "entry_price_2_estimated": bool(position.get("entry_price_2_estimated", False)),
+                "max_slippage_bps": close_slippage_bps,
                 "open_fees": open_fees_paid,
                 "close_fees_est": close_fees_est,
                 "net_pnl_est": net_pnl_est,
@@ -1023,9 +1248,12 @@ async def manage_trade_exits(node, indexer, wallet):
                 flush=True
             )
 
-            # ── Post-SL cooldown: bloquea re-entrada tras Z_SL o HARD_SL ──
+            # ── Risk cooldown: avoid immediately reopening a failed thesis ──
             is_sl_exit = close_reason is not None and (
-                "Z_SL" in close_reason or "HARD_SL" in close_reason
+                "Z_SL" in close_reason
+                or "HARD_SL" in close_reason
+                or "CONVERGED_LOSS" in close_reason
+                or "ADAPTIVE_TIME_STOP" in close_reason
             )
             if is_sl_exit:
                 half_life = _sf(position.get("half_life"), 0.0)

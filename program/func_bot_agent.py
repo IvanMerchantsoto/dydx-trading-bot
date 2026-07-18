@@ -72,6 +72,7 @@ class BotAgent:
         min_m1_fill_usd=50.0,
         min_m1_fill_ratio=0.05,
         intended_usd_per_trade=None,
+        intended_quote_usd=None,
         expected_edge_usd=0.0,       # 2026-05-26: needed for dynamic spread gate
         prepare_price_bps=2000,      # 20% lejos del oracle para no ejecutar
         # 2026-06-30: 2 → 10. Con 2 blocks (~3s) las txs llegaban al chain
@@ -106,6 +107,11 @@ class BotAgent:
         self.min_m1_fill_usd = float(min_m1_fill_usd)
         self.min_m1_fill_ratio = float(min_m1_fill_ratio)
         self.intended_usd_per_trade = float(intended_usd_per_trade) if intended_usd_per_trade is not None else None
+        self.intended_quote_usd = (
+            float(intended_quote_usd)
+            if intended_quote_usd is not None
+            else self.intended_usd_per_trade
+        )
         self.expected_edge_usd = float(expected_edge_usd) if expected_edge_usd is not None else 0.0
 
         self.prepare_price_bps = int(prepare_price_bps)
@@ -140,6 +146,8 @@ class BotAgent:
             "filled_usd_2": 0.0,
             "fee_1": 0.0,
             "fee_2": 0.0,
+            "entry_price_1_estimated": True,
+            "entry_price_2_estimated": True,
             "liquidity_1": None,
             "liquidity_2": None,
 
@@ -218,6 +226,15 @@ class BotAgent:
             delay = min(max_delay, base_delay * (2 ** i))
             await asyncio.sleep(delay)
 
+        if last and _sf(last.get("reported_filled_size", 0.0)) > 0:
+            # The order is confirmed filled but the Indexer has not exposed its
+            # fill rows after the full retry budget.  Keep the live exposure
+            # managed, explicitly marking its price as provisional so a later
+            # reconciliation can replace it.  Never use the IOC limit as a fill.
+            last["filled_size"] = _sf(last.get("reported_filled_size"))
+            last["status_label"] = "FILLED_PRICE_PENDING"
+            last["price_estimated"] = True
+            return last
         return last or {"found": False, "status_label": "NOT_FOUND", "filled_size": 0.0}
 
     async def open_trades(self, wallet):
@@ -256,7 +273,8 @@ class BotAgent:
             pf_ceiling = _EFFECTIVE_ENTRY_CEILING_BPS  # techo DURO de liquidez
             pf_floor = float(SPREAD_GATE_PER_LEG_FLOOR_BPS)
             pf_max_pct = float(SPREAD_GATE_MAX_PCT_OF_EDGE)
-            pf_notional = float(self.intended_usd_per_trade or 0.0)
+            pf_notional_1 = float(self.intended_usd_per_trade or 0.0)
+            pf_notional_2 = float(self.intended_quote_usd or 0.0)
             pf_edge = float(self.expected_edge_usd or 0.0)
 
             # Gate 1: Ceiling (any leg way too wide)
@@ -290,10 +308,12 @@ class BotAgent:
             pf_s2_below_floor = (pf_spread2 is None) or (pf_spread2 <= pf_floor)
             pf_floor_pass = pf_s1_below_floor and pf_s2_below_floor
 
-            if not pf_floor_pass and pf_edge > 0 and pf_notional > 0:
+            if not pf_floor_pass and pf_edge > 0 and pf_notional_1 > 0 and pf_notional_2 > 0:
                 pf_s1_val = float(pf_spread1) if pf_spread1 is not None else 0.0
                 pf_s2_val = float(pf_spread2) if pf_spread2 is not None else 0.0
-                pf_cost_usd = (pf_s1_val + pf_s2_val) * pf_notional / 10000.0
+                pf_cost_usd = (
+                    pf_s1_val * pf_notional_1 + pf_s2_val * pf_notional_2
+                ) / 10000.0
                 pf_max_cost = pf_max_pct * pf_edge
                 if pf_cost_usd > pf_max_cost:
                     reason = (
@@ -311,7 +331,8 @@ class BotAgent:
                         "market_2": self.market_2,
                         "spread_1_bps": round(pf_s1_val, 2),
                         "spread_2_bps": round(pf_s2_val, 2),
-                        "notional_per_leg": pf_notional,
+                        "notional_leg_1": pf_notional_1,
+                        "notional_leg_2": pf_notional_2,
                         "expected_edge_usd": round(pf_edge, 4),
                         "spread_cost_usd": round(pf_cost_usd, 4),
                         "max_cost_usd": round(pf_max_cost, 4),
@@ -448,9 +469,8 @@ class BotAgent:
         # crossing both books (entry + exit, both legs) is acceptable given
         # the expected edge of THIS specific trade.
         #
-        # Formula:
-        #   spread_cost_usd = (s1 + s2) × notional_per_leg / 10000
-        #   (derived from: 2 legs × 2 sides × half_spread × notional)
+        # Formula (full spread paid over entry+exit):
+        #   spread_cost_usd = (s1*N1 + s2*N2) / 10000
         #
         # Three-phase decision (see constants.py for details):
         #   1. FLOOR pass — both legs ≤ FLOOR_BPS → permit unconditionally
@@ -468,7 +488,8 @@ class BotAgent:
             floor_bps = float(SPREAD_GATE_PER_LEG_FLOOR_BPS)
             ceiling_bps = _EFFECTIVE_ENTRY_CEILING_BPS  # techo DURO de liquidez
             max_pct = float(SPREAD_GATE_MAX_PCT_OF_EDGE)
-            notional_per_leg = float(self.intended_usd_per_trade or 0.0)
+            notional_leg_1 = float(self.intended_usd_per_trade or 0.0)
+            notional_leg_2 = float(self.intended_quote_usd or 0.0)
             edge_usd = float(self.expected_edge_usd or 0.0)
 
             # Phase 1: floor pass
@@ -485,7 +506,9 @@ class BotAgent:
             # Use 0 for None spread (best case — book might not be wide, just unknown)
             s1_val = float(spread1) if spread1 is not None else 0.0
             s2_val = float(spread2) if spread2 is not None else 0.0
-            spread_cost_usd = (s1_val + s2_val) * notional_per_leg / 10000.0
+            spread_cost_usd = (
+                s1_val * notional_leg_1 + s2_val * notional_leg_2
+            ) / 10000.0
             max_cost_usd = max_pct * edge_usd if edge_usd > 0 else 0.0
             edge_check_known = edge_usd > 0
             phase3_pass = edge_check_known and (spread_cost_usd <= max_cost_usd)
@@ -527,7 +550,8 @@ class BotAgent:
                 "market_2": self.market_2,
                 "spread_1_bps": round(spread1, 2) if spread1 is not None else None,
                 "spread_2_bps": round(spread2, 2) if spread2 is not None else None,
-                "notional_per_leg": notional_per_leg,
+                "notional_leg_1": notional_leg_1,
+                "notional_leg_2": notional_leg_2,
                 "expected_edge_usd": round(edge_usd, 4),
                 "spread_cost_usd": round(spread_cost_usd, 4),
                 "max_cost_usd": round(max_cost_usd, 4),
@@ -637,8 +661,10 @@ class BotAgent:
 
         # E3 fix: usar el PRECIO REAL PROMEDIO de fill (con slippage incluido),
         # no el oráculo del escaneo. Fallback al ref sólo si el indexer no lo da.
-        avg_price_1 = _sf(audit_m1.get("avg_price"), 0.0) or float(self.base_price)
-        avg_price_2 = _sf(audit_m2.get("avg_price"), 0.0) or float(self.quote_price)
+        real_avg_price_1 = _sf(audit_m1.get("avg_price"), 0.0)
+        real_avg_price_2 = _sf(audit_m2.get("avg_price"), 0.0)
+        avg_price_1 = real_avg_price_1 or float(self.base_price)
+        avg_price_2 = real_avg_price_2 or float(self.quote_price)
 
         filled_usd_1 = real_filled_m1 * avg_price_1
         filled_usd_2 = real_filled_m2 * avg_price_2
@@ -650,6 +676,8 @@ class BotAgent:
         # Precio de entrada REAL (para el PnL de salida, no el oráculo).
         self.order_dict["avg_entry_price_1"] = avg_price_1
         self.order_dict["avg_entry_price_2"] = avg_price_2
+        self.order_dict["entry_price_1_estimated"] = real_avg_price_1 <= 0.0
+        self.order_dict["entry_price_2_estimated"] = real_avg_price_2 <= 0.0
         self.order_dict["fee_1"] = _sf(audit_m1.get("fee_total", 0))
         self.order_dict["fee_2"] = _sf(audit_m2.get("fee_total", 0))
         self.order_dict["fee_1_estimated"] = bool(audit_m1.get("fee_estimated", False))
@@ -670,6 +698,10 @@ class BotAgent:
             "fee_2": self.order_dict["fee_2"],
             "fee_1_estimated": self.order_dict["fee_1_estimated"],
             "fee_2_estimated": self.order_dict["fee_2_estimated"],
+            "avg_entry_price_1": avg_price_1,
+            "avg_entry_price_2": avg_price_2,
+            "entry_price_1_estimated": self.order_dict["entry_price_1_estimated"],
+            "entry_price_2_estimated": self.order_dict["entry_price_2_estimated"],
         })
 
         # =========================================================
@@ -734,6 +766,7 @@ class BotAgent:
                         filled_usd_1 = real_filled_m1 * float(self.base_price)
                         self.order_dict["filled_size_1"] = real_filled_m1
                         self.order_dict["filled_usd_1"] = filled_usd_1
+                        self.order_dict["entry_price_1_estimated"] = True
                 if status_m2 == "BEST_EFFORT_OPENED":
                     pos_m2 = real_pos.get(self.market_2)
                     if pos_m2:
@@ -741,6 +774,7 @@ class BotAgent:
                         filled_usd_2 = real_filled_m2 * float(self.quote_price)
                         self.order_dict["filled_size_2"] = real_filled_m2
                         self.order_dict["filled_usd_2"] = filled_usd_2
+                        self.order_dict["entry_price_2_estimated"] = True
                 # Si las piernas afectadas por BEST_EFFORT ya se resolvieron, parar.
                 m1_done = (status_m1 != "BEST_EFFORT_OPENED") or real_filled_m1 > 0
                 m2_done = (status_m2 != "BEST_EFFORT_OPENED") or real_filled_m2 > 0
@@ -962,12 +996,10 @@ class BotAgent:
             "max_abs_residual_usd": MAX_ABSOLUTE_RESIDUAL_USD,
         })
 
-        # Trigger flatten solo si AMBOS: ratio desviado >15% Y residual absoluto >$10
-        # (evita flatten cuando ratio no perfecto pero notional aún balanceado por scale)
-        _needs_flatten = (
-            _ratio_deviation_pct > MAX_RATIO_DEVIATION_PCT and
-            abs(residual_usd) > MAX_ABSOLUTE_RESIDUAL_USD
-        )
+        # Hedge correctness is an independent invariant.  Equal notionals do
+        # not make an incorrectly hedged spread safe, so a material ratio miss
+        # must never be accepted merely because residual_usd is small.
+        _needs_flatten = _ratio_deviation_pct > MAX_RATIO_DEVIATION_PCT
         if _needs_flatten:
             self.order_dict["flattened"] = True
             try:

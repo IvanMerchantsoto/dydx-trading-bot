@@ -57,6 +57,28 @@ Z_SL_DELTA = 1.5     # SL cuando abs(z_now) >= abs(z_entry) + 1.5
 USE_TIME_STOP = False
 TIME_STOP_HOURS = 24   # dejado aquí por si se reactiva (no se usa si USE_TIME_STOP=False)
 
+# Adaptive thesis-expiry guard.  A stat-arb trade that has lived several
+# estimated half-lives without becoming economically profitable is no longer
+# the trade selected at entry.  This is separate from the fixed TIME_STOP.
+ADAPTIVE_TIME_STOP_ENABLED = True
+ADAPTIVE_TIME_STOP_HALFLIVES = 2.0
+ADAPTIVE_TIME_STOP_MIN_HOURS = 8.0
+ADAPTIVE_TIME_STOP_MAX_HOURS = 24.0
+
+# When the frozen entry spread target has been reached but the actual hedged
+# portfolio is still losing, the z-score thesis and economic PnL disagree.
+# Exit only after sufficient age and only through a tight IOC budget.
+CONVERGED_LOSS_EXIT_ENABLED = False
+CONVERGED_LOSS_MIN_PROGRESS = 0.90
+CONVERGED_LOSS_MIN_HALFLIVES = 1.0
+CONVERGED_LOSS_MAX_SPREAD_BPS = 60.0
+MARKET_MAX_SLIPPAGE_BPS_CONVERGED_LOSS = 60
+
+# With level-price OLS, beta should be close to the live price ratio.  A large
+# dollar-notional imbalance therefore signals a stale/unstable hedge rather
+# than intentional risk.  Reject before sending any order.
+MAX_HEDGE_NOTIONAL_IMBALANCE_PCT = 25.0
+
 # ===== TP Confirmation =====
 # El usuario eligió "doble confirmación sin hold mínimo":
 # - No hay tiempo mínimo de tenencia antes de TP
@@ -220,12 +242,10 @@ DYNAMIC_SIZING_MAX_USD = 40.0     # 2026-07-12: 80 → 40. Con $600 equity: 5%=$
 # the equity measured at session start. Entries resume after DRAWDOWN_HALT_HOURS.
 # Only counts positions opened in the current session (uses unrealizedPnL delta).
 DRAWDOWN_CIRCUIT_BREAKER_ENABLED = True
-# 2026-05-26: subido de 3% a 20% para operación $100 mainnet.
-# A 3% sobre $100 = $3 → se dispararía con un solo trade malo.
-# A 20% sobre $100 = $20 → halt cuando pierdes una quinta parte del capital.
-# Cuando subas a $500+ equity: bajar a 5% ($25 halt).
-# Cuando subas a $5,000+: bajar a 3% original.
-DRAWDOWN_CIRCUIT_BREAKER_PCT = 0.20
+# Production reconciliation showed that several small execution losses can
+# accumulate without tripping the old 20% threshold.  At ~$590, 2% is ~$12:
+# enough for normal variance but tight enough to stop roughly two SL waves.
+DRAWDOWN_CIRCUIT_BREAKER_PCT = 0.02
 DRAWDOWN_HALT_HOURS = 4.0             # halt duration in hours
 
 # ===== Pre-COMMIT Spread Gate (DYNAMIC) =====
@@ -516,12 +536,17 @@ LOCAL_SEQUENCE_MANAGEMENT = True
 #   EXIT:    salidas por SL/HARD_SL/TP-market — prioriza el fill pero acotado.
 #   FLATTEN: limpieza de piernas huérfanas / cierre forzoso — debe llenar.
 MARKET_MAX_SLIPPAGE_BPS_ENTRY   = 40
+MARKET_MAX_SLIPPAGE_BPS_TP      = 40
 MARKET_MAX_SLIPPAGE_BPS_EXIT    = 200
 MARKET_MAX_SLIPPAGE_BPS_FLATTEN = 400
 MARKET_MAX_SLIPPAGE_BPS_DEFAULT = 80
 # Tope duro vs oráculo: aunque touch+tolerancia lo permita, jamás pagar más
 # lejos del oráculo que esto (defensa contra books rotos / oráculo torcido).
 MARKET_SLIPPAGE_ORACLE_CAP_BPS  = 500
+
+# Exit decisions use bid/ask rather than oracle marks.  Reserve another 20bps
+# per leg for movement between the decision snapshot and the IOC execution.
+EXIT_PNL_RESERVE_BPS = 20
 
 # ============================================================================
 # ===== Kill-switch de pérdida absoluta (persistente entre reinicios) =====
@@ -533,10 +558,9 @@ MARKET_SLIPPAGE_ORACLE_CAP_BPS  = 500
 # histórico más de KILL_SWITCH_MAX_DRAWDOWN_(USD|PCT), CIERRA todas las
 # posiciones y bloquea nuevas entradas hasta reset manual.
 KILL_SWITCH_ENABLED = True
-# 2026-07-12: 40 → 25 para el piloto controlado con equity ~$589.
-# 25 USD ≈ 4.2% del equity → corta la sangría temprano en el piloto.
-KILL_SWITCH_MAX_DRAWDOWN_USD = 25.0     # pérdida absoluta desde el high-water
-KILL_SWITCH_MAX_DRAWDOWN_PCT = 0.08     # o % del high-water (lo que ocurra antes)
+# Tight pilot limit: the observed 10-day loss was already close to $15.
+KILL_SWITCH_MAX_DRAWDOWN_USD = 15.0     # ~3 hard-stop waves at current pilot size
+KILL_SWITCH_MAX_DRAWDOWN_PCT = 0.03     # persistent high-water protection
 # Slippage para el cierre de emergencia del kill-switch (debe llenar).
 KILL_SWITCH_CLOSE_SLIPPAGE_BPS = 400
 

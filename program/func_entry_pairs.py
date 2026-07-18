@@ -8,6 +8,7 @@ from constants import (
     MARKET_BLACKLIST,
     HEDGE_RATIO_LOG_MAX,
     MAX_TRADES_PER_MARKET,
+    MAX_HEDGE_NOTIONAL_IMBALANCE_PCT,
 )
 from func_utils import format_number
 from func_public import get_candles_recent, get_market_spread_bps, get_funding_rates
@@ -16,6 +17,7 @@ from datetime import datetime, timezone
 from constants import WALLET_ADDRESS
 from func_bot_agent import BotAgent
 from func_logging import log_event
+from func_strategy import hedge_weighted_sizes, hedge_notionals
 
 import pandas as pd
 import json
@@ -588,15 +590,48 @@ async def open_positions(
 
         spread_dev = abs(spread_last - spread_mean_prev)
 
-        base_quantity = eff_usd / base_price
-        quote_quantity = eff_usd / quote_price
-        approx_spread_usd = spread_dev * min(base_quantity, quote_quantity)
+        # The signal is defined on spread = P1 - hedge_ratio * P2.  Replicate
+        # that same portfolio in execution: Q2/Q1 must equal hedge_ratio.
+        # Equal-dollar sizing only matches this by coincidence when
+        # hedge_ratio == P1/P2 and otherwise creates directional exposure.
+        try:
+            base_quantity, quote_quantity = hedge_weighted_sizes(
+                base_price, quote_price, hedge_ratio, eff_usd
+            )
+        except ValueError:
+            _skip_invalid += 1
+            continue
+
+        # If the spread returns from spread_last to the frozen pre-entry mean,
+        # portfolio PnL before costs is Q1 * |delta spread|.
+        approx_spread_usd = spread_dev * abs(base_quantity)
 
         base_side = "BUY" if z_score < 0 else "SELL"
         quote_side = "BUY" if z_score > 0 else "SELL"
 
         base_size_fmt = format_number(base_quantity, base_step)
         quote_size_fmt = format_number(quote_quantity, quote_step)
+
+        base_notional, quote_notional = hedge_notionals(
+            float(base_size_fmt), float(quote_size_fmt), base_price, quote_price
+        )
+        notional_imbalance_pct = (
+            abs(quote_notional - base_notional) / max(base_notional, 1e-9) * 100.0
+        )
+        if notional_imbalance_pct > float(MAX_HEDGE_NOTIONAL_IMBALANCE_PCT):
+            _skip_invalid += 1
+            log_event({
+                "type": "signal_skip",
+                "reason": "hedge_notional_imbalance",
+                "base": base_market,
+                "quote": quote_market,
+                "base_notional": round(base_notional, 4),
+                "quote_notional": round(quote_notional, 4),
+                "imbalance_pct": round(notional_imbalance_pct, 2),
+                "max_pct": float(MAX_HEDGE_NOTIONAL_IMBALANCE_PCT),
+                "hedge_ratio": hedge_ratio,
+            }, print_terminal=False)
+            continue
 
         failsafe_p = base_price * (1.02 if base_side == "BUY" else 0.98)
         accept_failsafe_base_price = format_number(failsafe_p, tick_base)
@@ -626,6 +661,8 @@ async def open_positions(
             "half_life": half_life,
             "z_score": z_score,
             "spread_dev": spread_dev,
+            "entry_spread": spread_last,
+            "entry_spread_target": spread_mean_prev,
             "approx_spread_usd": approx_spread_usd,
             "base_side": base_side,
             "quote_side": quote_side,
@@ -633,6 +670,9 @@ async def open_positions(
             "quote_price": quote_price,
             "base_size_fmt": base_size_fmt,
             "quote_size_fmt": quote_size_fmt,
+            "base_notional": base_notional,
+            "quote_notional": quote_notional,
+            "notional_imbalance_pct": notional_imbalance_pct,
             "accept_failsafe_base_price": accept_failsafe_base_price,
             "spread_bps": spread_bps,
             "score": score,
@@ -709,11 +749,16 @@ async def open_positions(
         approx_spread_usd = cand["approx_spread_usd"]
 
         # ── Gate A: Min edge ─────────────────────────────────────────────
-        min_edge_required = MIN_EDGE_FEE_MULTIPLE * fee_round_trip
+        # Candidate-specific cost: hedge-weighted legs need not have identical
+        # dollar notionals.
+        candidate_fee_round_trip = 2.0 * (
+            cand["base_notional"] + cand["quote_notional"]
+        ) * TAKER_FEE_BPS
+        min_edge_required = MIN_EDGE_FEE_MULTIPLE * candidate_fee_round_trip
         if approx_spread_usd < min_edge_required:
             print(f"[ENTRY] SKIP {base_market}/{quote_market}: min_edge "
                   f"edge=${approx_spread_usd:.2f} < required=${min_edge_required:.2f} "
-                  f"(fee_rt=${fee_round_trip:.2f}×{MIN_EDGE_FEE_MULTIPLE}x) "
+                  f"(fee_rt=${candidate_fee_round_trip:.2f}×{MIN_EDGE_FEE_MULTIPLE}x) "
                   f"z={z_score:.2f}", flush=True)
             log_event({
                 "type": "signal_skip",
@@ -722,7 +767,7 @@ async def open_positions(
                 "quote": quote_market,
                 "approx_spread_usd": round(approx_spread_usd, 4),
                 "min_edge_required": round(min_edge_required, 4),
-                "fee_round_trip": round(fee_round_trip, 4),
+                "fee_round_trip": round(candidate_fee_round_trip, 4),
                 "score": round(cand["score"], 4),
             })
             continue
@@ -737,8 +782,8 @@ async def open_positions(
             funding_periods = max(1.0, hold_hours / 8.0)
 
             # Longs pay when rate > 0; shorts receive when rate > 0.
-            base_funding = eff_usd * fr_base * funding_periods * (1.0 if base_side == "BUY" else -1.0)
-            quote_funding = eff_usd * fr_quote * funding_periods * (1.0 if quote_side == "BUY" else -1.0)
+            base_funding = cand["base_notional"] * fr_base * funding_periods * (1.0 if base_side == "BUY" else -1.0)
+            quote_funding = cand["quote_notional"] * fr_quote * funding_periods * (1.0 if quote_side == "BUY" else -1.0)
             net_funding = base_funding + quote_funding  # positive = net cost to us
 
             log_event({
@@ -825,6 +870,7 @@ async def open_positions(
             hedge_ratio=cand["hedge_ratio"],
             trace_id=trace_id,
             intended_usd_per_trade=eff_usd,
+            intended_quote_usd=cand["quote_notional"],
             expected_edge_usd=approx_spread_usd,   # 2026-05-26: needed for dynamic spread gate
             min_m1_fill_usd=dynamic_min_fill,      # 2026-05-26: scales with eff_usd
         )
@@ -846,6 +892,10 @@ async def open_positions(
                 "filled_usd_2": _sf(bot_open_dict.get("filled_usd_2")),
                 "fee_1": _sf(bot_open_dict.get("fee_1")),
                 "fee_2": _sf(bot_open_dict.get("fee_2")),
+                "avg_entry_price_1": _sf(bot_open_dict.get("avg_entry_price_1")),
+                "avg_entry_price_2": _sf(bot_open_dict.get("avg_entry_price_2")),
+                "entry_price_1_estimated": bool(bot_open_dict.get("entry_price_1_estimated", True)),
+                "entry_price_2_estimated": bool(bot_open_dict.get("entry_price_2_estimated", True)),
                 "score": round(cand["score"], 4),
             })
 
@@ -871,6 +921,11 @@ async def open_positions(
             bot_open_dict["size_1"] = bot_open_dict.get("size_1") or _sf(bot_open_dict.get("filled_size_1"), _sf(cand["base_size_fmt"]))
             bot_open_dict["size_2"] = bot_open_dict.get("size_2") or _sf(bot_open_dict.get("filled_size_2"), _sf(cand["quote_size_fmt"]))
             bot_open_dict["entry_score"] = round(cand["score"], 4)  # for future analysis
+            # Freeze the economic target present when the trade was opened.
+            # Exit diagnostics must not call a rolling mean that moves toward
+            # the position a successful reversion.
+            bot_open_dict["entry_spread"] = float(cand["entry_spread"])
+            bot_open_dict["entry_spread_target"] = float(cand["entry_spread_target"])
 
             bot_agents.append(bot_open_dict)
             with open(JSON_PATH, "w") as f:

@@ -46,10 +46,19 @@ from constants import (
     USD_PER_TRADE, HARD_SL_USD, HARD_SL_PCT,
     MAX_HALF_LIFE, WINDOW, HEDGE_RATIO_LOG_MAX, HURST_MAX,
     TAKER_FEE_BPS, INDEXER,
+    ADAPTIVE_TIME_STOP_ENABLED, ADAPTIVE_TIME_STOP_HALFLIVES,
+    ADAPTIVE_TIME_STOP_MIN_HOURS, ADAPTIVE_TIME_STOP_MAX_HOURS,
+    CONVERGED_LOSS_EXIT_ENABLED, CONVERGED_LOSS_MIN_PROGRESS,
+    CONVERGED_LOSS_MIN_HALFLIVES,
+    MAX_HEDGE_NOTIONAL_IMBALANCE_PCT,
 )
 from func_cointegration import (
     calculate_cointegration, calculate_half_life,
     calculate_hurst_exponent, calculate_zscore,
+)
+from func_strategy import (
+    hedge_weighted_sizes, hedge_notionals, estimate_round_trip_cost,
+    spread_convergence_progress,
 )
 
 SCRIPT_DIR = Path(__file__).parent
@@ -233,8 +242,10 @@ def simulate_test(p1_full, p2_full, test_start, test_end, hedge_ratio, half_life
     entry_side = "short"
     tp_confirm = 0
     best_z = 99.0
+    entry_spread = 0.0
+    entry_spread_target = 0.0
     notional = 2.0 * usd
-    exec_cost = 4.0 * usd * (cost_bps_leg / 10_000.0)
+    exec_cost = 0.0
     hard_level = max(float(params["hard_sl_usd"]), float(params["hard_sl_pct"]) * notional)
 
     lo = max(test_start, window + 1)
@@ -251,6 +262,24 @@ def simulate_test(p1_full, p2_full, test_start, test_end, hedge_ratio, half_life
                 entry_p1 = p1_full[i]
                 entry_p2 = p2_full[i]
                 entry_side = "short" if z > 0 else "long"
+                entry_spread = spread[i]
+                entry_spread_target = float(np.mean(spread[i-window:i]))
+                sz1, sz2 = hedge_weighted_sizes(
+                    entry_p1, entry_p2, hedge_ratio, usd
+                )
+                n1, n2 = hedge_notionals(sz1, sz2, entry_p1, entry_p2)
+                imbalance_pct = abs(n2 - n1) / max(n1, 1e-9) * 100.0
+                if imbalance_pct > float(MAX_HEDGE_NOTIONAL_IMBALANCE_PCT):
+                    state = "flat"
+                    continue
+                notional = n1 + n2
+                exec_cost = estimate_round_trip_cost(
+                    notional, cost_bps_leg / 10_000.0
+                )
+                hard_level = max(
+                    float(params["hard_sl_usd"]),
+                    float(params["hard_sl_pct"]) * notional,
+                )
                 best_z = abs(z)
                 tp_confirm = 0
             continue
@@ -258,8 +287,6 @@ def simulate_test(p1_full, p2_full, test_start, test_end, hedge_ratio, half_life
         # in_trade
         best_z = min(best_z, abs(z))
         hold = i - entry_i
-        sz1 = usd / entry_p1
-        sz2 = usd / entry_p2
         if entry_side == "short":   # short m1 / long m2
             pnl1 = (entry_p1 - p1_full[i]) * sz1
             pnl2 = (p2_full[i] - entry_p2) * sz2
@@ -270,6 +297,9 @@ def simulate_test(p1_full, p2_full, test_start, test_end, hedge_ratio, half_life
 
         funding = funding_bps_day / 10_000.0 * notional * (hold / 24.0)
         net = pnl_gross - exec_cost - funding
+        convergence_progress = spread_convergence_progress(
+            entry_spread, entry_spread_target, spread[i]
+        )
 
         reason = None
         # 1) HARD_SL monetario — sólo en stop_mode='monetary'
@@ -289,6 +319,20 @@ def simulate_test(p1_full, p2_full, test_start, test_end, hedge_ratio, half_life
                 tp_confirm = 0
             if tp_confirm >= tp_confirm_req and net > 0:
                 reason = "TP"
+        if (
+            reason is None and CONVERGED_LOSS_EXIT_ENABLED and net <= 0
+            and convergence_progress >= float(CONVERGED_LOSS_MIN_PROGRESS)
+            and hold >= max(1.0, half_life * float(CONVERGED_LOSS_MIN_HALFLIVES))
+        ):
+            reason = "CONVERGED_LOSS"
+        if reason is None and ADAPTIVE_TIME_STOP_ENABLED and net <= 0:
+            expiry_bars = min(
+                float(ADAPTIVE_TIME_STOP_MAX_HOURS),
+                max(float(ADAPTIVE_TIME_STOP_MIN_HOURS),
+                    half_life * float(ADAPTIVE_TIME_STOP_HALFLIVES)),
+            )
+            if hold >= expiry_bars:
+                reason = "ADAPTIVE_TIME_STOP"
         if reason is None and hold >= time_stop_bars:
             reason = "TIME_STOP"
 
@@ -312,6 +356,9 @@ def metrics(trades, usd, years):
     if not trades:
         return {"n": 0}
     df = pd.DataFrame(trades)
+    if "close_ts" in df.columns:
+        # Portfolio drawdown must follow wall-clock order, not pair iteration.
+        df = df.sort_values("close_ts").reset_index(drop=True)
     n = len(df)
     net = df["net_pnl"]
     wins = net[net > 0]
@@ -397,6 +444,9 @@ def run_walk_forward(pairs, cache, unique_markets, args, params):
                                     args.usd, args.cost_bps_per_leg, args.funding_bps_day, params)
                 for t in trs:
                     t["pair"] = f"{m1}/{m2}"
+                    ci = t.get("close_i")
+                    if isinstance(ci, int) and 0 <= ci < len(ts):
+                        t["close_ts"] = ts[ci]
                 all_trades.extend(trs)
                 if trs:
                     folds_used += 1

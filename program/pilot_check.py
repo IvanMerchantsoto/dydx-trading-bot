@@ -91,6 +91,11 @@ def main():
         print(f"     {c}: {n}{tag}")
     er = Counter(e.get("pair_status") for e in evs if e.get("type") == "entry_result")
     print(f"  entry_result: {dict(er)}")
+    residuals = [e for e in evs if e.get("type") == "residual"]
+    if residuals:
+        deviations = [float(e.get("ratio_deviation_pct", 0) or 0) for e in residuals]
+        print(f"  hedge ratio deviation: max={max(deviations):.2f}%  "
+              f"avg={sum(deviations)/len(deviations):.2f}%  n={len(deviations)}")
 
     # ── E2: slippage / precio ────────────────────────────────────────────
     sec("3. E2 — PRECIO ACOTADO (book vs oráculo)")
@@ -130,7 +135,9 @@ def main():
     sec("6. E3 — CIERRES y PnL reconciliado a fills")
     closes = [e for e in evs if e.get("type") == "trade_closed"]
     recon = [e for e in evs if e.get("type") == "pnl_gross_reconciled_to_fills"]
+    entry_recon = [e for e in evs if e.get("type") == "entry_fill_reconciled"]
     print(f"  trade_closed: {len(closes)}   pnl_gross_reconciled_to_fills: {len(recon)}")
+    print(f"  entry_fill_reconciled (fills tardíos): {len(entry_recon)}")
     tot_net = sum(float(e.get("net_pnl_est", 0) or 0) for e in closes)
     print(f"  Σ net_pnl_est interno (log): ${tot_net:+.4f}")
     print(f"  ⚠️ El interno NO es la verdad: corre reconcile_pnl.py --days 1")
@@ -138,6 +145,8 @@ def main():
         print(f"     - {e.get('market_1')}/{e.get('market_2')}  "
               f"reason={str(e.get('close_reason'))[:48]}")
         print(f"         gross=${float(e.get('pnl_gross',0) or 0):+.4f}  "
+              f"mark_decision=${float(e.get('pnl_gross_mark_at_decision',0) or 0):+.4f}  "
+              f"exec_decision=${float(e.get('pnl_gross_executable_at_decision',0) or 0):+.4f}  "
               f"net_est=${float(e.get('net_pnl_est',0) or 0):+.4f}  "
               f"fees=${float(e.get('open_fees',0) or 0)+float(e.get('close_fees_est',0) or 0):.4f}  "
               f"prov={e.get('pnl_provisional')}")
@@ -146,8 +155,22 @@ def main():
               f"gross_oracle=${e.get('pnl_gross_oracle')} → gross_fills=${e.get('pnl_gross_real_fills')} "
               f"(delta ${e.get('slippage_delta')})")
 
+    # ── Thesis expiry / convergence mismatch ─────────────────────────────
+    sec("7. TESIS AGOTADA — CONVERGENCIA Y TIME STOP")
+    cge = [e for e in evs if e.get("type") == "converged_loss_evaluated"]
+    print(f"  converged_loss_evaluated: {len(cge)}")
+    print(f"  CONVERGED_LOSS closes:    "
+          f"{sum('CONVERGED_LOSS' in str(e.get('close_reason','')) for e in closes)}")
+    print(f"  ADAPTIVE_TIME_STOP closes: "
+          f"{sum('ADAPTIVE_TIME_STOP' in str(e.get('close_reason','')) for e in closes)}")
+    for e in cge[-5:]:
+        print(f"     - {e.get('m1')}/{e.get('m2')} progress={e.get('progress')} "
+              f"age={e.get('age_hours')}h pnl=${e.get('pnl_gross')} "
+              f"spreads={e.get('spread_1_bps')}/{e.get('spread_2_bps')}bps "
+              f"liquid={e.get('liquid_enough')}")
+
     # ── Ciclo de vida del último trade LIVE ──────────────────────────────
-    sec("7. CICLO DE VIDA DEL ÚLTIMO TRADE LIVE")
+    sec("8. CICLO DE VIDA DEL ÚLTIMO TRADE LIVE")
     live_traces = [e.get("trace_id") for e in evs
                    if e.get("type") == "entry_result" and e.get("pair_status") == "LIVE"]
     if not live_traces:
@@ -158,6 +181,7 @@ def main():
         want = {"entry_signal", "open_start", "spread_check", "tx_market", "commit_sent",
                 "commit_leg_retry", "order_chain_rejected", "sequence_resync", "audit",
                 "fills", "min_fill_gate", "open_live", "entry_result",
+                "entry_fill_reconciled",
                 "zscore_live", "trade_close_signal", "close_fees_polled",
                 "pnl_gross_reconciled_to_fills", "post_close_verified_flat",
                 "post_close_residual_detected", "trade_closed"}

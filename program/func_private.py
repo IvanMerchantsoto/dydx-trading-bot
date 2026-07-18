@@ -18,6 +18,7 @@ from constants import (
     MARKET_SLIPPAGE_ORACLE_CAP_BPS,
 )
 from func_logging import log_event
+from func_fill_audit import summarize_order_fills
 
 
 # ---------------------------------------------------------------------------
@@ -500,25 +501,13 @@ async def place_limit_order(
 # ---------------------------------------------------------------------------
 
 async def get_real_fill_details(indexer, client_id, market, max_fill_lookback=200):
-    cid = str(client_id)
+    """Resolve a client order and return its actual weighted fill price.
 
-    def _extract_cid(obj):
-        return str(
-            obj.get("clientId")
-            or obj.get("client_id")
-            or obj.get("orderClientId")
-            or obj.get("order_client_id")
-            or ""
-        )
-
-    def _extract_fee(fill):
-        return (
-            _sf(fill.get("fee"))
-            or _sf(fill.get("feeAmount"))
-            or _sf(fill.get("feeUsd"))
-            or 0.0
-        )
-
+    Indexer fill records reference the exchange order UUID, not ``clientId``.
+    We therefore fetch orders and fills, resolve clientId -> order id, and join
+    on that id.  The old implementation attempted a direct fill/clientId match
+    and then commonly mistook the IOC limit for its execution price.
+    """
     await asyncio.sleep(1.2)
 
     fills_candidates = []
@@ -545,44 +534,6 @@ async def get_real_fill_details(indexer, client_id, market, max_fill_lookback=20
     except Exception:
         pass
 
-    matched_fills = [f for f in fills_candidates if _extract_cid(f) == cid]
-
-    if matched_fills:
-        total_size = 0.0
-        total_usd = 0.0
-        total_fee = 0.0
-        liquidity = None
-
-        for fill in matched_fills:
-            size = _sf(fill.get("size") or fill.get("filledSize") or fill.get("amount"))
-            price = _sf(fill.get("price") or fill.get("fillPrice"))
-            total_size += size
-            total_usd += size * price
-            total_fee += _extract_fee(fill)
-            liquidity = fill.get("liquidity") or fill.get("liquiditySide") or liquidity
-
-        avg_price = total_usd / total_size if total_size > 0 else 0.0
-
-        # Fallback: indexer (especially testnet) often omits fee data.
-        # If fee_total is zero but we have a real fill, estimate taker fee.
-        fee_estimated = False
-        if total_fee == 0.0 and total_usd > 0.0:
-            total_fee = total_usd * TAKER_FEE_BPS
-            fee_estimated = True
-
-        return {
-            "found": True,
-            "status_label": "FILLED" if total_size > 0 else "BEST_EFFORT_OPENED",
-            "raw_status": "FILLED" if total_size > 0 else "BEST_EFFORT_OPENED",
-            "filled_size": total_size,
-            "filled_usd_est": total_usd,
-            "fee_total": total_fee,
-            "fee_estimated": fee_estimated,
-            "liquidity": liquidity,
-            "server_order_id": None,
-            "avg_price": avg_price,
-        }
-
     orders_candidates = []
     try:
         orders_resp = await indexer.account.get_subaccount_orders(
@@ -607,73 +558,15 @@ async def get_real_fill_details(indexer, client_id, market, max_fill_lookback=20
     except Exception:
         pass
 
-    seen = set()
-    deduped_orders = []
-    for order in orders_candidates:
-        key = str(order.get("id") or "") + "|" + str(order.get("clientId") or "")
-        if key not in seen:
-            seen.add(key)
-            deduped_orders.append(order)
-
-    for order in deduped_orders:
-        if _extract_cid(order) != cid:
-            continue
-
-        raw_status = str(order.get("status") or "UNKNOWN").upper()
-        original_size = _sf(order.get("size", 0))
-        remaining = _sf(order.get("remainingSize", 0))
-
-        # ── BUGFIX 2026-07-13 (LTC/INJ) ──────────────────────────────────────
-        # avg_price debe ser el precio REAL de ejecución. NUNCA order["price"],
-        # que es el LÍMITE de la IOC (touch ± banda de slippage 40-200bps). Usar
-        # el límite falseaba el PnL ~2% del notional/pierna SIEMPRE hacia pérdida
-        # (LTC/INJ: recompute -$1.08 cuando el fill real dio +$0.30). Si no hay
-        # avg real disponible, avg_price=0.0 → el recompute E3 lo IGNORA y
-        # conserva el proxy de oráculo (menos sesgado que el precio límite).
-        avg_price = _sf(order.get("averageFilledPrice") or order.get("avgFillPrice") or 0.0)
-        limit_price_est = _sf(order.get("price"))   # sólo para estimar notional
-
-        filled_size = _sf(
-            order.get("totalFilled")
-            or order.get("filledSize")
-            or order.get("sizeFilled")
-            or max(0.0, original_size - remaining)
-        )
-
-        fee_total = _sf(order.get("fee") or order.get("feeAmount") or order.get("feeUsd") or 0.0)
-        # Para el notional (gate de min-fill, fee estimada) sí podemos usar el
-        # límite como aproximación cuando falta el avg real — no afecta al PnL.
-        filled_usd = filled_size * (avg_price if avg_price > 0 else limit_price_est)
-
-        # Fallback: estimate taker fee when indexer omits fee data
-        fee_estimated = False
-        if fee_total == 0.0 and filled_usd > 0.0:
-            fee_total = filled_usd * TAKER_FEE_BPS
-            fee_estimated = True
-
-        if raw_status == "FILLED":
-            status_label = "FILLED"
-        elif raw_status == "CANCELED" and filled_size > 0:
-            status_label = "PARTIALLY_FILLED_IOC"
-        elif raw_status == "CANCELED" and filled_size <= 0:
-            status_label = "KILLED_BY_FOK"
-        elif raw_status in ("OPEN", "PENDING") and filled_size > 0:
-            status_label = "BEST_EFFORT_OPENED"
-        else:
-            status_label = raw_status
-
-        return {
-            "found": True,
-            "status_label": status_label,
-            "raw_status": raw_status,
-            "filled_size": filled_size,
-            "filled_usd_est": filled_usd,
-            "fee_total": fee_total,
-            "fee_estimated": fee_estimated,
-            "liquidity": order.get("liquidity") or order.get("liquiditySide"),
-            "server_order_id": order.get("id"),
-            "avg_price": avg_price,
-        }
+    result = summarize_order_fills(
+        client_id,
+        market,
+        orders_candidates,
+        fills_candidates,
+        taker_fee_rate=TAKER_FEE_BPS,
+    )
+    if result is not None:
+        return result
 
     return {
         "found": False,
@@ -685,6 +578,8 @@ async def get_real_fill_details(indexer, client_id, market, max_fill_lookback=20
         "liquidity": None,
         "server_order_id": None,
         "avg_price": 0.0,
+        "price_estimated": True,
+        "matched_fill_count": 0,
     }
 
 
